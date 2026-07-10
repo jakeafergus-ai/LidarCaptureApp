@@ -6,31 +6,32 @@ struct CameraPreviewView: UIViewRepresentable {
     @ObservedObject var controller: CaptureSessionController
 
     func makeUIView(context: Context) -> PreviewUIView {
-        let view = PreviewUIView()
-        view.videoPreviewLayer.session = controller.session
-        view.videoPreviewLayer.videoGravity = .resizeAspectFill
-        return view
+        PreviewUIView(previewLayer: controller.previewLayer)
     }
 
     func updateUIView(_ uiView: PreviewUIView, context: Context) {
-        // The session object itself can be swapped out (e.g. switching lens mode
-        // rebuilds the AVCaptureSession/AVCaptureMultiCamSession), so re-attach it.
-        if uiView.videoPreviewLayer.session !== controller.session {
-            uiView.videoPreviewLayer.session = controller.session
-        }
-
         let angle = controller.previewRotationAngle
-        if let connection = uiView.videoPreviewLayer.connection, connection.isVideoRotationAngleSupported(angle) {
+        if let connection = uiView.previewLayer.connection, connection.isVideoRotationAngleSupported(angle) {
             connection.videoRotationAngle = angle
         }
     }
 }
 
 final class PreviewUIView: UIView {
-    override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
+    let previewLayer: AVCaptureVideoPreviewLayer
 
-    var videoPreviewLayer: AVCaptureVideoPreviewLayer {
-        // swiftlint:disable:next force_cast
-        layer as! AVCaptureVideoPreviewLayer
+    init(previewLayer: AVCaptureVideoPreviewLayer) {
+        self.previewLayer = previewLayer
+        super.init(frame: .zero)
+        layer.addSublayer(previewLayer)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        previewLayer.frame = bounds
     }
 }

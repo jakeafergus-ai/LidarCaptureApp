@@ -7,6 +7,7 @@ protocol CaptureFrameSink: AnyObject {
 
 final class CaptureSessionController: NSObject, ObservableObject {
     @Published private(set) var session: AVCaptureSession = AVCaptureSession()
+    let previewLayer = AVCaptureVideoPreviewLayer()
     private let dataOutputQueue = DispatchQueue(label: "capture.dataOutputQueue", qos: .userInitiated)
 
     private var videoDataOutput: AVCaptureVideoDataOutput?
@@ -28,6 +29,11 @@ final class CaptureSessionController: NSObject, ObservableObject {
     @Published private(set) var depthAvailable = false
     @Published private(set) var lastHardwareCost: Double = 0
     @Published private(set) var lastSystemPressureCost: Double = 0
+
+    override init() {
+        super.init()
+        previewLayer.videoGravity = .resizeAspectFill
+    }
 
     func requestPermissionAndConfigure() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
@@ -77,6 +83,7 @@ final class CaptureSessionController: NSObject, ObservableObject {
 
     // MARK: 1x mode - one physical device provides both wide video and LiDAR depth.
     // Also used as the ultrawide-video-only fallback when multicam isn't viable.
+    // Single video-capable input, so automatic preview/output connection is unambiguous.
 
     private func configureSingleCameraSession(deviceType: AVCaptureDevice.DeviceType, withDepth: Bool) {
         let newSession = AVCaptureSession()
@@ -111,6 +118,7 @@ final class CaptureSessionController: NSObject, ObservableObject {
         newSession.addOutput(videoOutput)
 
         var depthOutput: AVCaptureDepthDataOutput?
+        var depthFormatSelected = false
         if withDepth {
             let output = AVCaptureDepthDataOutput()
             output.isFilteringEnabled = false
@@ -121,7 +129,7 @@ final class CaptureSessionController: NSObject, ObservableObject {
             }
             newSession.addOutput(output)
             depthOutput = output
-            selectDepthFormat(for: device)
+            depthFormatSelected = selectDepthFormat(for: device)
         }
 
         var outputsToSync: [AVCaptureOutput] = [videoOutput]
@@ -135,19 +143,26 @@ final class CaptureSessionController: NSObject, ObservableObject {
         self.depthDataOutput = depthOutput
         self.outputSynchronizer = synchronizer
         self.session = newSession
+        previewLayer.session = newSession
 
         setUpRotationCoordinator(device: device)
 
         DispatchQueue.main.async {
             self.isConfigured = true
-            self.depthAvailable = withDepth
+            self.depthAvailable = withDepth && depthFormatSelected
             self.lastHardwareCost = 0
             self.lastSystemPressureCost = 0
+            if withDepth && !depthFormatSelected {
+                self.setupError = "No depth-capable format found for \(device.localizedName)."
+            }
         }
     }
 
     // MARK: 0.5x mode - AVCaptureMultiCamSession combining the ultrawide camera
     // (video) with the LiDAR device (depth-only, no video output requested from it).
+    // Two video-capable inputs exist here, so every connection - including the
+    // preview layer's - must be wired explicitly to the correct port; automatic
+    // connection matching is ambiguous and silently picks the wrong one.
     // Falls back to ultrawide-video-only if the hardware can't sustain both.
 
     private func configureMultiCamSession() {
@@ -178,6 +193,13 @@ final class CaptureSessionController: NSObject, ObservableObject {
             newSession.addInputWithNoConnections(lidarInput)
             newSession.addInputWithNoConnections(ultrawideInput)
 
+            guard let ultrawidePort = ultrawideInput.ports(for: .video,
+                                                             sourceDeviceType: ultrawideDevice.deviceType,
+                                                             sourceDevicePosition: .back).first else {
+                newSession.commitConfiguration()
+                throw MultiCamSetupError.generic("No video port on ultrawide input.")
+            }
+
             let videoOutput = AVCaptureVideoDataOutput()
             guard newSession.canAddOutput(videoOutput) else {
                 newSession.commitConfiguration()
@@ -185,18 +207,21 @@ final class CaptureSessionController: NSObject, ObservableObject {
             }
             newSession.addOutputWithNoConnections(videoOutput)
 
-            guard let ultrawidePort = ultrawideInput.ports(for: .video,
-                                                             sourceDeviceType: ultrawideDevice.deviceType,
-                                                             sourceDevicePosition: .back).first else {
-                newSession.commitConfiguration()
-                throw MultiCamSetupError.generic("No video port on ultrawide input.")
-            }
             let videoConnection = AVCaptureConnection(inputPorts: [ultrawidePort], output: videoOutput)
             guard newSession.canAddConnection(videoConnection) else {
                 newSession.commitConfiguration()
                 throw MultiCamSetupError.generic("Cannot connect ultrawide video.")
             }
             newSession.addConnection(videoConnection)
+
+            // Preview layer needs its own explicit connection to the same port -
+            // one physical port can feed both the data output and the preview.
+            let previewConnection = AVCaptureConnection(inputPort: ultrawidePort, videoPreviewLayer: previewLayer)
+            guard newSession.canAddConnection(previewConnection) else {
+                newSession.commitConfiguration()
+                throw MultiCamSetupError.generic("Cannot connect ultrawide preview.")
+            }
+            newSession.addConnection(previewConnection)
 
             let depthOutput = AVCaptureDepthDataOutput()
             depthOutput.isFilteringEnabled = false
@@ -219,7 +244,7 @@ final class CaptureSessionController: NSObject, ObservableObject {
             }
             newSession.addConnection(depthConnection)
 
-            selectDepthFormat(for: lidarDevice)
+            let depthFormatSelected = selectDepthFormat(for: lidarDevice)
 
             let synchronizer = AVCaptureDataOutputSynchronizer(dataOutputs: [videoOutput, depthOutput])
             synchronizer.setDelegate(self, queue: dataOutputQueue)
@@ -246,12 +271,16 @@ final class CaptureSessionController: NSObject, ObservableObject {
             self.depthDataOutput = depthOutput
             self.outputSynchronizer = synchronizer
             self.session = newSession
+            previewLayer.setSessionWithNoConnection(newSession)
 
             setUpRotationCoordinator(device: ultrawideDevice)
 
             DispatchQueue.main.async {
                 self.isConfigured = true
-                self.depthAvailable = true
+                self.depthAvailable = depthFormatSelected
+                if !depthFormatSelected {
+                    self.setupError = "0.5x video is running, but no depth-capable format was found for the LiDAR device in this configuration."
+                }
             }
         } catch {
             let message = (error as? MultiCamSetupError)?.message ?? error.localizedDescription
@@ -267,22 +296,41 @@ final class CaptureSessionController: NSObject, ObservableObject {
         }
     }
 
-    private func selectDepthFormat(for device: AVCaptureDevice) {
-        guard let depthFormat = device.activeFormat.supportedDepthDataFormats.first(where: {
-            CMFormatDescriptionGetMediaSubType($0.formatDescription) == kCVPixelFormatType_DepthFloat32
-        }) else { return }
+    /// Searches every format the device supports (not just its current default
+    /// activeFormat) for one with a depth-capable pairing, since a multicam
+    /// session's default format for a depth-only-purposed device may not have one.
+    @discardableResult
+    private func selectDepthFormat(for device: AVCaptureDevice) -> Bool {
+        func depthFormat(in format: AVCaptureDevice.Format) -> AVCaptureDevice.Format? {
+            format.supportedDepthDataFormats.first {
+                CMFormatDescriptionGetMediaSubType($0.formatDescription) == kCVPixelFormatType_DepthFloat32
+            }
+        }
+
+        let candidateFormat = depthFormat(in: device.activeFormat) != nil
+            ? device.activeFormat
+            : device.formats.first { depthFormat(in: $0) != nil }
+
+        guard let chosenFormat = candidateFormat, let depthFormat = depthFormat(in: chosenFormat) else {
+            return false
+        }
 
         do {
             try device.lockForConfiguration()
+            if device.activeFormat != chosenFormat {
+                device.activeFormat = chosenFormat
+            }
             device.activeDepthDataFormat = depthFormat
             device.unlockForConfiguration()
+            return true
         } catch {
             DispatchQueue.main.async { self.setupError = "Depth format config error: \(error.localizedDescription)" }
+            return false
         }
     }
 
     private func setUpRotationCoordinator(device: AVCaptureDevice) {
-        let coordinator = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: nil)
+        let coordinator = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: previewLayer)
         rotationCoordinator = coordinator
 
         captureAngleObservation = coordinator.observe(\.videoRotationAngleForHorizonLevelCapture, options: [.initial, .new]) { [weak self] coordinator, _ in
