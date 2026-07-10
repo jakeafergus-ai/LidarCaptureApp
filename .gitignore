@@ -4,3 +4,8 @@ build/
 *.xcworkspace
 DerivedData/
 .swiftpm/
+
+# Downloaded installers/artifacts that don't belong in source control
+*.exe
+*.ipa
+.ipa's/
