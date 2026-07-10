@@ -193,6 +193,13 @@ final class CaptureSessionController: NSObject, ObservableObject {
             newSession.addInputWithNoConnections(lidarInput)
             newSession.addInputWithNoConnections(ultrawideInput)
 
+            // Pick the LiDAR device's format before wiring anything that references
+            // it: only formats marked isMultiCamSupported are usable at all once a
+            // device is part of a multicam session, and the depth pairing lives on
+            // the video format, not a separate setting - so this has to happen
+            // before any connection depending on this device's current format exists.
+            let depthFormatSelected = selectDepthFormat(for: lidarDevice, requireMultiCamSupport: true)
+
             guard let ultrawidePort = ultrawideInput.ports(for: .video,
                                                              sourceDeviceType: ultrawideDevice.deviceType,
                                                              sourceDevicePosition: .back).first else {
@@ -243,8 +250,6 @@ final class CaptureSessionController: NSObject, ObservableObject {
                 throw MultiCamSetupError.generic("Cannot connect LiDAR depth.")
             }
             newSession.addConnection(depthConnection)
-
-            let depthFormatSelected = selectDepthFormat(for: lidarDevice)
 
             let synchronizer = AVCaptureDataOutputSynchronizer(dataOutputs: [videoOutput, depthOutput])
             synchronizer.setDelegate(self, queue: dataOutputQueue)
@@ -299,17 +304,25 @@ final class CaptureSessionController: NSObject, ObservableObject {
     /// Searches every format the device supports (not just its current default
     /// activeFormat) for one with a depth-capable pairing, since a multicam
     /// session's default format for a depth-only-purposed device may not have one.
+    /// When requireMultiCamSupport is set, only formats with isMultiCamSupported
+    /// are considered - a device inside a multicam session can only actually use
+    /// those, even for a port (like depth) unrelated to what the flag name implies.
     @discardableResult
-    private func selectDepthFormat(for device: AVCaptureDevice) -> Bool {
+    private func selectDepthFormat(for device: AVCaptureDevice, requireMultiCamSupport: Bool = false) -> Bool {
         func depthFormat(in format: AVCaptureDevice.Format) -> AVCaptureDevice.Format? {
             format.supportedDepthDataFormats.first {
                 CMFormatDescriptionGetMediaSubType($0.formatDescription) == kCVPixelFormatType_DepthFloat32
             }
         }
 
-        let candidateFormat = depthFormat(in: device.activeFormat) != nil
+        let eligibleFormats = requireMultiCamSupport ? device.formats.filter { $0.isMultiCamSupported } : device.formats
+
+        let activeFormatEligible = depthFormat(in: device.activeFormat) != nil
+            && (!requireMultiCamSupport || device.activeFormat.isMultiCamSupported)
+
+        let candidateFormat = activeFormatEligible
             ? device.activeFormat
-            : device.formats.first { depthFormat(in: $0) != nil }
+            : eligibleFormats.first { depthFormat(in: $0) != nil }
 
         guard let chosenFormat = candidateFormat, let depthFormat = depthFormat(in: chosenFormat) else {
             return false
