@@ -58,6 +58,15 @@ struct MainCaptureView: View {
                 Text(depthStatusText)
                     .font(.caption2)
                     .foregroundStyle(sessionController.depthAvailable ? .green : .orange)
+
+                if !sessionController.diagSummary.isEmpty {
+                    Text(sessionController.diagSummary)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.white)
+                        .padding(4)
+                        .background(.black.opacity(0.6))
+                        .cornerRadius(4)
+                }
             }
         }
         .padding(.top, 40)

@@ -5,14 +5,29 @@ protocol CaptureFrameSink: AnyObject {
     func captureController(_ controller: CaptureSessionController, didOutput sampleBuffer: CMSampleBuffer, depthData: AVDepthData?)
 }
 
+/// Consumes and discards the LiDAR device's companion wide-video frames in 0.5x
+/// mode. That stream is never recorded - it exists only because depth generation
+/// rides on the device's video pipeline, which doesn't run without a consumer.
+private final class DiscardingVideoDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {}
+
 final class CaptureSessionController: NSObject, ObservableObject {
     @Published private(set) var session: AVCaptureSession = AVCaptureSession()
     let previewLayer = AVCaptureVideoPreviewLayer()
     private let dataOutputQueue = DispatchQueue(label: "capture.dataOutputQueue", qos: .userInitiated)
+    private let discardQueue = DispatchQueue(label: "capture.discardQueue", qos: .utility)
+    private let discardDelegate = DiscardingVideoDelegate()
 
     private var videoDataOutput: AVCaptureVideoDataOutput?
     private var depthDataOutput: AVCaptureDepthDataOutput?
+    private var lidarCompanionVideoOutput: AVCaptureVideoDataOutput?
     private var outputSynchronizer: AVCaptureDataOutputSynchronizer?
+
+    // Diagnostics for the 0.5x depth investigation - updated on dataOutputQueue,
+    // mirrored to diagSummary on main every ~30 video callbacks.
+    private var diagVideoCallbackCount = 0
+    private var diagDepthPresentCount = 0
+    private var diagDepthDroppedCount = 0
+    private var diagConfigSummary = ""
 
     private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
     private var captureAngleObservation: NSKeyValueObservation?
@@ -29,6 +44,7 @@ final class CaptureSessionController: NSObject, ObservableObject {
     @Published private(set) var depthAvailable = false
     @Published private(set) var lastHardwareCost: Double = 0
     @Published private(set) var lastSystemPressureCost: Double = 0
+    @Published private(set) var diagSummary = ""
 
     override init() {
         super.init()
@@ -141,6 +157,7 @@ final class CaptureSessionController: NSObject, ObservableObject {
 
         self.videoDataOutput = videoOutput
         self.depthDataOutput = depthOutput
+        self.lidarCompanionVideoOutput = nil
         self.outputSynchronizer = synchronizer
         self.session = newSession
         previewLayer.session = newSession
@@ -198,7 +215,7 @@ final class CaptureSessionController: NSObject, ObservableObject {
             // device is part of a multicam session, and the depth pairing lives on
             // the video format, not a separate setting - so this has to happen
             // before any connection depending on this device's current format exists.
-            let depthFormatSelected = selectDepthFormat(for: lidarDevice, requireMultiCamSupport: true)
+            let depthFormatSelected = selectMultiCamDepthFormat(for: lidarDevice)
 
             guard let ultrawidePort = ultrawideInput.ports(for: .video,
                                                              sourceDeviceType: ultrawideDevice.deviceType,
@@ -251,6 +268,32 @@ final class CaptureSessionController: NSObject, ObservableObject {
             }
             newSession.addConnection(depthConnection)
 
+            // Companion wide-video stream from the LiDAR device. Never recorded -
+            // depth generation is slaved to the device's video pipeline, and with
+            // only the depth port connected that pipeline never runs, so no depth
+            // frames are ever produced (observed on-device: session configures
+            // with valid costs but zero depth callbacks).
+            guard let lidarVideoPort = lidarInput.ports(for: .video,
+                                                          sourceDeviceType: lidarDevice.deviceType,
+                                                          sourceDevicePosition: .back).first else {
+                newSession.commitConfiguration()
+                throw MultiCamSetupError.generic("No video port on LiDAR input.")
+            }
+            let companionOutput = AVCaptureVideoDataOutput()
+            companionOutput.alwaysDiscardsLateVideoFrames = true
+            guard newSession.canAddOutput(companionOutput) else {
+                newSession.commitConfiguration()
+                throw MultiCamSetupError.generic("Cannot add LiDAR companion video output.")
+            }
+            newSession.addOutputWithNoConnections(companionOutput)
+            let companionConnection = AVCaptureConnection(inputPorts: [lidarVideoPort], output: companionOutput)
+            guard newSession.canAddConnection(companionConnection) else {
+                newSession.commitConfiguration()
+                throw MultiCamSetupError.generic("Cannot connect LiDAR companion video.")
+            }
+            newSession.addConnection(companionConnection)
+            companionOutput.setSampleBufferDelegate(discardDelegate, queue: discardQueue)
+
             let synchronizer = AVCaptureDataOutputSynchronizer(dataOutputs: [videoOutput, depthOutput])
             synchronizer.setDelegate(self, queue: dataOutputQueue)
 
@@ -258,6 +301,10 @@ final class CaptureSessionController: NSObject, ObservableObject {
             let systemPressureCost = Double(newSession.systemPressureCost)
 
             newSession.commitConfiguration()
+
+            let depthConnectionActive = depthConnection.isActive
+            diagConfigSummary += String(format: " | depthConn %@ | hw %.2f pr %.2f", depthConnectionActive ? "active" : "INACTIVE", hardwareCost, systemPressureCost)
+            publishDiagSummary()
 
             DispatchQueue.main.async {
                 self.lastHardwareCost = hardwareCost
@@ -274,9 +321,16 @@ final class CaptureSessionController: NSObject, ObservableObject {
 
             self.videoDataOutput = videoOutput
             self.depthDataOutput = depthOutput
+            self.lidarCompanionVideoOutput = companionOutput
             self.outputSynchronizer = synchronizer
             self.session = newSession
             previewLayer.setSessionWithNoConnection(newSession)
+
+            dataOutputQueue.async {
+                self.diagVideoCallbackCount = 0
+                self.diagDepthPresentCount = 0
+                self.diagDepthDroppedCount = 0
+            }
 
             setUpRotationCoordinator(device: ultrawideDevice)
 
@@ -284,7 +338,7 @@ final class CaptureSessionController: NSObject, ObservableObject {
                 self.isConfigured = true
                 self.depthAvailable = depthFormatSelected
                 if !depthFormatSelected {
-                    self.setupError = "0.5x video is running, but no depth-capable format was found for the LiDAR device in this configuration."
+                    self.setupError = "0.5x video is running, but no multicam-compatible depth format was found for the LiDAR device."
                 }
             }
         } catch {
@@ -301,37 +355,66 @@ final class CaptureSessionController: NSObject, ObservableObject {
         }
     }
 
-    /// Searches every format the device supports (not just its current default
-    /// activeFormat) for one with a depth-capable pairing, since a multicam
-    /// session's default format for a depth-only-purposed device may not have one.
-    /// When requireMultiCamSupport is set, only formats with isMultiCamSupported
-    /// are considered - a device inside a multicam session can only actually use
-    /// those, even for a port (like depth) unrelated to what the flag name implies.
+    private func float32DepthFormat(in format: AVCaptureDevice.Format) -> AVCaptureDevice.Format? {
+        format.supportedDepthDataFormats.first {
+            CMFormatDescriptionGetMediaSubType($0.formatDescription) == kCVPixelFormatType_DepthFloat32
+        }
+    }
+
+    /// 1x path: searches every format the device supports (not just its current
+    /// default activeFormat) for one with a depth-capable pairing.
     @discardableResult
-    private func selectDepthFormat(for device: AVCaptureDevice, requireMultiCamSupport: Bool = false) -> Bool {
-        func depthFormat(in format: AVCaptureDevice.Format) -> AVCaptureDevice.Format? {
-            format.supportedDepthDataFormats.first {
-                CMFormatDescriptionGetMediaSubType($0.formatDescription) == kCVPixelFormatType_DepthFloat32
-            }
+    private func selectDepthFormat(for device: AVCaptureDevice) -> Bool {
+        let candidateFormat = float32DepthFormat(in: device.activeFormat) != nil
+            ? device.activeFormat
+            : device.formats.first { float32DepthFormat(in: $0) != nil }
+
+        guard let chosenFormat = candidateFormat, let depthFormat = float32DepthFormat(in: chosenFormat) else {
+            return false
+        }
+        return apply(format: chosenFormat, depthFormat: depthFormat, to: device)
+    }
+
+    /// 0.5x path: a device inside a multicam session can only use formats marked
+    /// isMultiCamSupported, so the intersection of multicam-compatible and
+    /// depth-capable is required. Among eligible formats the smallest resolution
+    /// wins - the wide video stream is discarded anyway, so spending ISP bandwidth
+    /// on it just burns hardware-cost budget. Also records format counts into the
+    /// diagnostics string so on-device results show exactly what was available.
+    private func selectMultiCamDepthFormat(for device: AVCaptureDevice) -> Bool {
+        let allFormats = device.formats
+        let multiCamFormats = allFormats.filter { $0.isMultiCamSupported }
+        let depthCapable = allFormats.filter { float32DepthFormat(in: $0) != nil }
+        let eligible = multiCamFormats.filter { float32DepthFormat(in: $0) != nil }
+
+        diagConfigSummary = "fmts \(allFormats.count) mc \(multiCamFormats.count) depth \(depthCapable.count) both \(eligible.count)"
+
+        let chosenFormat = eligible.min { lhs, rhs in
+            let l = CMVideoFormatDescriptionGetDimensions(lhs.formatDescription)
+            let r = CMVideoFormatDescriptionGetDimensions(rhs.formatDescription)
+            return l.width < r.width
         }
 
-        let eligibleFormats = requireMultiCamSupport ? device.formats.filter { $0.isMultiCamSupported } : device.formats
-
-        let activeFormatEligible = depthFormat(in: device.activeFormat) != nil
-            && (!requireMultiCamSupport || device.activeFormat.isMultiCamSupported)
-
-        let candidateFormat = activeFormatEligible
-            ? device.activeFormat
-            : eligibleFormats.first { depthFormat(in: $0) != nil }
-
-        guard let chosenFormat = candidateFormat, let depthFormat = depthFormat(in: chosenFormat) else {
+        guard let chosenFormat, let depthFormat = float32DepthFormat(in: chosenFormat) else {
+            publishDiagSummary()
             return false
         }
 
+        let dims = CMVideoFormatDescriptionGetDimensions(chosenFormat.formatDescription)
+        let depthDims = CMVideoFormatDescriptionGetDimensions(depthFormat.formatDescription)
+        diagConfigSummary += " | chose \(dims.width)x\(dims.height) d \(depthDims.width)x\(depthDims.height)"
+
+        let applied = apply(format: chosenFormat, depthFormat: depthFormat, to: device)
+        if !applied { diagConfigSummary += " | APPLY FAILED" }
+        publishDiagSummary()
+        return applied
+    }
+
+    private func apply(format: AVCaptureDevice.Format, depthFormat: AVCaptureDevice.Format, to device: AVCaptureDevice) -> Bool {
         do {
             try device.lockForConfiguration()
-            if device.activeFormat != chosenFormat {
-                device.activeFormat = chosenFormat
+            if device.activeFormat != format {
+                device.activeFormat = format
             }
             device.activeDepthDataFormat = depthFormat
             device.unlockForConfiguration()
@@ -340,6 +423,11 @@ final class CaptureSessionController: NSObject, ObservableObject {
             DispatchQueue.main.async { self.setupError = "Depth format config error: \(error.localizedDescription)" }
             return false
         }
+    }
+
+    private func publishDiagSummary() {
+        let summary = diagConfigSummary
+        DispatchQueue.main.async { self.diagSummary = summary }
     }
 
     private func setUpRotationCoordinator(device: AVCaptureDevice) {
@@ -396,16 +484,26 @@ extension CaptureSessionController: AVCaptureDataOutputSynchronizerDelegate {
                                  didOutput synchronizedDataCollection: AVCaptureSynchronizedDataCollection) {
         guard let videoOutput = videoDataOutput else { return }
 
+        var depthData: AVDepthData?
+        if let depthOutput = depthDataOutput,
+           let syncedDepthData = synchronizedDataCollection.synchronizedData(for: depthOutput) as? AVCaptureSynchronizedDepthData {
+            if syncedDepthData.depthDataWasDropped {
+                diagDepthDroppedCount += 1
+            } else {
+                diagDepthPresentCount += 1
+                depthData = syncedDepthData.depthData
+            }
+        }
+
+        diagVideoCallbackCount += 1
+        if diagVideoCallbackCount % 30 == 0 {
+            let summary = "\(diagConfigSummary) | cb v \(diagVideoCallbackCount) d \(diagDepthPresentCount) drop \(diagDepthDroppedCount)"
+            DispatchQueue.main.async { self.diagSummary = summary }
+        }
+
         guard let syncedVideoData = synchronizedDataCollection.synchronizedData(for: videoOutput)
                 as? AVCaptureSynchronizedSampleBufferData,
               !syncedVideoData.sampleBufferWasDropped else { return }
-
-        var depthData: AVDepthData?
-        if let depthOutput = depthDataOutput,
-           let syncedDepthData = synchronizedDataCollection.synchronizedData(for: depthOutput) as? AVCaptureSynchronizedDepthData,
-           !syncedDepthData.depthDataWasDropped {
-            depthData = syncedDepthData.depthData
-        }
 
         frameSink?.captureController(self, didOutput: syncedVideoData.sampleBuffer, depthData: depthData)
     }
