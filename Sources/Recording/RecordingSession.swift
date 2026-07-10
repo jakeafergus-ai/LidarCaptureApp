@@ -18,7 +18,7 @@ final class RecordingSession {
         self.extraMetadata = extraMetadata
     }
 
-    func handle(sampleBuffer: CMSampleBuffer, depthData: AVDepthData?) {
+    func handleVideo(sampleBuffer: CMSampleBuffer) {
         guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
 
         if !started {
@@ -32,12 +32,15 @@ final class RecordingSession {
 
         videoWriter.append(sampleBuffer)
         frameCount += 1
+    }
 
-        if let depthData {
-            let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            depthWriter.write(depthData, timestamp: timestamp)
-            depthFrameCount = depthWriter.frameCount
-        }
+    // Depth is written on its own clock, independent of video frames: in 0.5x
+    // mode depth (wide camera) and video (ultrawide) tick at unrelated times, so
+    // depth must never be gated on a video frame arriving alongside it. Both
+    // streams share the session clock, so timestamps stay comparable downstream.
+    func handleDepth(depthData: AVDepthData, timestamp: CMTime) {
+        depthWriter.write(depthData, timestamp: timestamp)
+        depthFrameCount = depthWriter.frameCount
     }
 
     func finish(completion: @escaping () -> Void) {

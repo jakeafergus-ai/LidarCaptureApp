@@ -2,7 +2,8 @@ import AVFoundation
 import CoreVideo
 
 protocol CaptureFrameSink: AnyObject {
-    func captureController(_ controller: CaptureSessionController, didOutput sampleBuffer: CMSampleBuffer, depthData: AVDepthData?)
+    func captureController(_ controller: CaptureSessionController, didOutputVideo sampleBuffer: CMSampleBuffer)
+    func captureController(_ controller: CaptureSessionController, didOutputDepth depthData: AVDepthData, timestamp: CMTime)
 }
 
 /// Consumes and discards the LiDAR device's companion wide-video frames in 0.5x
@@ -27,6 +28,7 @@ final class CaptureSessionController: NSObject, ObservableObject {
     private var diagVideoCallbackCount = 0
     private var diagDepthPresentCount = 0
     private var diagDepthDroppedCount = 0
+    private var diagCollectionCount = 0
     private var diagConfigSummary = ""
 
     private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
@@ -330,6 +332,7 @@ final class CaptureSessionController: NSObject, ObservableObject {
                 self.diagVideoCallbackCount = 0
                 self.diagDepthPresentCount = 0
                 self.diagDepthDroppedCount = 0
+                self.diagCollectionCount = 0
             }
 
             setUpRotationCoordinator(device: ultrawideDevice)
@@ -480,31 +483,36 @@ final class CaptureSessionController: NSObject, ObservableObject {
 }
 
 extension CaptureSessionController: AVCaptureDataOutputSynchronizerDelegate {
+    // Video and depth are delivered to the sink independently: in 0.5x mode they
+    // come from different physical cameras whose frame timing rarely coincides,
+    // so the synchronizer usually delivers depth in collections that contain no
+    // ultrawide video frame at all. Requiring both in one collection silently
+    // discards every depth frame (observed on-device: depth callbacks counted,
+    // zero depth files written). Both devices share the session clock, so the
+    // per-stream timestamps remain comparable for downstream alignment.
     func dataOutputSynchronizer(_ synchronizer: AVCaptureDataOutputSynchronizer,
                                  didOutput synchronizedDataCollection: AVCaptureSynchronizedDataCollection) {
-        guard let videoOutput = videoDataOutput else { return }
-
-        var depthData: AVDepthData?
         if let depthOutput = depthDataOutput,
            let syncedDepthData = synchronizedDataCollection.synchronizedData(for: depthOutput) as? AVCaptureSynchronizedDepthData {
             if syncedDepthData.depthDataWasDropped {
                 diagDepthDroppedCount += 1
             } else {
                 diagDepthPresentCount += 1
-                depthData = syncedDepthData.depthData
+                frameSink?.captureController(self, didOutputDepth: syncedDepthData.depthData, timestamp: syncedDepthData.timestamp)
             }
         }
 
-        diagVideoCallbackCount += 1
-        if diagVideoCallbackCount % 30 == 0 {
+        if let videoOutput = videoDataOutput,
+           let syncedVideoData = synchronizedDataCollection.synchronizedData(for: videoOutput) as? AVCaptureSynchronizedSampleBufferData,
+           !syncedVideoData.sampleBufferWasDropped {
+            diagVideoCallbackCount += 1
+            frameSink?.captureController(self, didOutputVideo: syncedVideoData.sampleBuffer)
+        }
+
+        diagCollectionCount += 1
+        if diagCollectionCount % 30 == 0 {
             let summary = "\(diagConfigSummary) | cb v \(diagVideoCallbackCount) d \(diagDepthPresentCount) drop \(diagDepthDroppedCount)"
             DispatchQueue.main.async { self.diagSummary = summary }
         }
-
-        guard let syncedVideoData = synchronizedDataCollection.synchronizedData(for: videoOutput)
-                as? AVCaptureSynchronizedSampleBufferData,
-              !syncedVideoData.sampleBufferWasDropped else { return }
-
-        frameSink?.captureController(self, didOutput: syncedVideoData.sampleBuffer, depthData: depthData)
     }
 }
