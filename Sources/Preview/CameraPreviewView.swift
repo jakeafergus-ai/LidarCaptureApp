@@ -13,6 +13,12 @@ struct CameraPreviewView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: PreviewUIView, context: Context) {
+        // The session object itself can be swapped out (e.g. switching lens mode
+        // rebuilds the AVCaptureSession/AVCaptureMultiCamSession), so re-attach it.
+        if uiView.videoPreviewLayer.session !== controller.session {
+            uiView.videoPreviewLayer.session = controller.session
+        }
+
         let angle = controller.previewRotationAngle
         if let connection = uiView.videoPreviewLayer.connection, connection.isVideoRotationAngleSupported(angle) {
             connection.videoRotationAngle = angle

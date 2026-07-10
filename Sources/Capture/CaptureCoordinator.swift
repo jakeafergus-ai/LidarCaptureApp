@@ -20,9 +20,20 @@ final class CaptureCoordinator: NSObject, ObservableObject, CaptureFrameSink {
         sessionController.startRunning()
     }
 
+    func switchLensMode(to mode: LensMode) {
+        guard !isRecording else { return }
+        sessionController.switchLensMode(to: mode)
+    }
+
     func beginRecording(sessionName: String) {
         guard !isRecording else { return }
-        guard let recordingSession = RecordingSession(sessionName: sessionName) else {
+        let extraMetadata: [String: Any] = [
+            "lensMode": sessionController.lensMode == .wide1x ? "wide1x" : "ultrawide0_5x",
+            "depthAvailable": sessionController.depthAvailable,
+            "hardwareCost": sessionController.lastHardwareCost,
+            "systemPressureCost": sessionController.lastSystemPressureCost
+        ]
+        guard let recordingSession = RecordingSession(sessionName: sessionName, extraMetadata: extraMetadata) else {
             statusMessage = "Failed to create session folder"
             return
         }

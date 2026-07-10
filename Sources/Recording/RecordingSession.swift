@@ -9,11 +9,13 @@ final class RecordingSession {
     private let depthWriter: DepthSidecarWriter
     private let startedAt = Date()
     private var started = false
+    private let extraMetadata: [String: Any]
 
-    init?(sessionName: String) {
+    init?(sessionName: String, extraMetadata: [String: Any] = [:]) {
         guard let folder = SessionFolder.create(sessionName: sessionName) else { return nil }
         self.folder = folder
         self.depthWriter = DepthSidecarWriter(depthFolderURL: folder.depthFolderURL)
+        self.extraMetadata = extraMetadata
     }
 
     func handle(sampleBuffer: CMSampleBuffer, depthData: AVDepthData?) {
@@ -46,13 +48,16 @@ final class RecordingSession {
     }
 
     private func writeManifest() {
-        let manifest: [String: Any] = [
+        var manifest: [String: Any] = [
             "sessionName": folder.name,
             "startedAt": ISO8601DateFormatter().string(from: startedAt),
             "finishedAt": ISO8601DateFormatter().string(from: Date()),
             "videoFrameCount": frameCount,
             "depthFrameCount": depthFrameCount
         ]
+        for (key, value) in extraMetadata {
+            manifest[key] = value
+        }
         guard let data = try? JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted]) else { return }
         try? data.write(to: folder.manifestURL)
     }

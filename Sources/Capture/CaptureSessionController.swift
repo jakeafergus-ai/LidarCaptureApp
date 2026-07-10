@@ -6,34 +6,40 @@ protocol CaptureFrameSink: AnyObject {
 }
 
 final class CaptureSessionController: NSObject, ObservableObject {
-    let session = AVCaptureSession()
+    @Published private(set) var session: AVCaptureSession = AVCaptureSession()
     private let dataOutputQueue = DispatchQueue(label: "capture.dataOutputQueue", qos: .userInitiated)
 
     private var videoDataOutput: AVCaptureVideoDataOutput?
     private var depthDataOutput: AVCaptureDepthDataOutput?
     private var outputSynchronizer: AVCaptureDataOutputSynchronizer?
 
-    private var device: AVCaptureDevice?
     private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
     private var captureAngleObservation: NSKeyValueObservation?
     private var previewAngleObservation: NSKeyValueObservation?
     private var isRotationLockedForRecording = false
+    private var hasPermission = false
 
     weak var frameSink: CaptureFrameSink?
 
     @Published var isConfigured = false
     @Published var setupError: String?
     @Published var previewRotationAngle: CGFloat = 90
+    @Published private(set) var lensMode: LensMode = .wide1x
+    @Published private(set) var depthAvailable = false
+    @Published private(set) var lastHardwareCost: Double = 0
+    @Published private(set) var lastSystemPressureCost: Double = 0
 
     func requestPermissionAndConfigure() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
-            configureSession()
+            hasPermission = true
+            configureSession(for: lensMode)
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
                 guard let self else { return }
+                self.hasPermission = granted
                 if granted {
-                    self.configureSession()
+                    self.configureSession(for: self.lensMode)
                 } else {
                     DispatchQueue.main.async { self.setupError = "Camera access denied." }
                 }
@@ -43,64 +49,236 @@ final class CaptureSessionController: NSObject, ObservableObject {
         }
     }
 
-    private func configureSession() {
-        session.beginConfiguration()
-        defer { session.commitConfiguration() }
+    func switchLensMode(to newMode: LensMode) {
+        guard newMode != lensMode else { return }
+        let wasRunning = session.isRunning
+        if wasRunning { session.stopRunning() }
+        lensMode = newMode
+        if hasPermission {
+            configureSession(for: newMode)
+        }
+        if wasRunning { startRunning() }
+    }
 
-        guard let device = AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: .back) else {
-            DispatchQueue.main.async { self.setupError = "LiDAR camera not available on this device." }
+    private func configureSession(for mode: LensMode) {
+        captureAngleObservation?.invalidate()
+        previewAngleObservation?.invalidate()
+        captureAngleObservation = nil
+        previewAngleObservation = nil
+        rotationCoordinator = nil
+
+        switch mode {
+        case .wide1x:
+            configureSingleCameraSession(deviceType: .builtInLiDARDepthCamera, withDepth: true)
+        case .ultrawide0_5x:
+            configureMultiCamSession()
+        }
+    }
+
+    // MARK: 1x mode - one physical device provides both wide video and LiDAR depth.
+    // Also used as the ultrawide-video-only fallback when multicam isn't viable.
+
+    private func configureSingleCameraSession(deviceType: AVCaptureDevice.DeviceType, withDepth: Bool) {
+        let newSession = AVCaptureSession()
+        newSession.beginConfiguration()
+
+        guard let device = AVCaptureDevice.default(deviceType, for: .video, position: .back) else {
+            newSession.commitConfiguration()
+            DispatchQueue.main.async { self.setupError = "Required camera not available on this device." }
             return
         }
-        self.device = device
 
         do {
             let input = try AVCaptureDeviceInput(device: device)
-            guard session.canAddInput(input) else {
+            guard newSession.canAddInput(input) else {
+                newSession.commitConfiguration()
                 DispatchQueue.main.async { self.setupError = "Cannot add camera input." }
                 return
             }
-            session.addInput(input)
+            newSession.addInput(input)
         } catch {
+            newSession.commitConfiguration()
             DispatchQueue.main.async { self.setupError = "Camera input error: \(error.localizedDescription)" }
             return
         }
 
         let videoOutput = AVCaptureVideoDataOutput()
-        guard session.canAddOutput(videoOutput) else {
+        guard newSession.canAddOutput(videoOutput) else {
+            newSession.commitConfiguration()
             DispatchQueue.main.async { self.setupError = "Cannot add video output." }
             return
         }
-        session.addOutput(videoOutput)
-        self.videoDataOutput = videoOutput
+        newSession.addOutput(videoOutput)
 
-        let depthOutput = AVCaptureDepthDataOutput()
-        depthOutput.isFilteringEnabled = false
-        guard session.canAddOutput(depthOutput) else {
-            DispatchQueue.main.async { self.setupError = "Cannot add depth output." }
-            return
-        }
-        session.addOutput(depthOutput)
-        self.depthDataOutput = depthOutput
-
-        if let depthFormat = device.activeFormat.supportedDepthDataFormats.first(where: {
-            CMFormatDescriptionGetMediaSubType($0.formatDescription) == kCVPixelFormatType_DepthFloat32
-        }) {
-            do {
-                try device.lockForConfiguration()
-                device.activeDepthDataFormat = depthFormat
-                device.unlockForConfiguration()
-            } catch {
-                DispatchQueue.main.async { self.setupError = "Depth format config error: \(error.localizedDescription)" }
+        var depthOutput: AVCaptureDepthDataOutput?
+        if withDepth {
+            let output = AVCaptureDepthDataOutput()
+            output.isFilteringEnabled = false
+            guard newSession.canAddOutput(output) else {
+                newSession.commitConfiguration()
+                DispatchQueue.main.async { self.setupError = "Cannot add depth output." }
+                return
             }
+            newSession.addOutput(output)
+            depthOutput = output
+            selectDepthFormat(for: device)
         }
 
-        let synchronizer = AVCaptureDataOutputSynchronizer(dataOutputs: [videoOutput, depthOutput])
+        var outputsToSync: [AVCaptureOutput] = [videoOutput]
+        if let depthOutput { outputsToSync.append(depthOutput) }
+        let synchronizer = AVCaptureDataOutputSynchronizer(dataOutputs: outputsToSync)
         synchronizer.setDelegate(self, queue: dataOutputQueue)
+
+        newSession.commitConfiguration()
+
+        self.videoDataOutput = videoOutput
+        self.depthDataOutput = depthOutput
         self.outputSynchronizer = synchronizer
+        self.session = newSession
 
         setUpRotationCoordinator(device: device)
 
-        DispatchQueue.main.async { self.isConfigured = true }
+        DispatchQueue.main.async {
+            self.isConfigured = true
+            self.depthAvailable = withDepth
+            self.lastHardwareCost = 0
+            self.lastSystemPressureCost = 0
+        }
+    }
+
+    // MARK: 0.5x mode - AVCaptureMultiCamSession combining the ultrawide camera
+    // (video) with the LiDAR device (depth-only, no video output requested from it).
+    // Falls back to ultrawide-video-only if the hardware can't sustain both.
+
+    private func configureMultiCamSession() {
+        guard let lidarDevice = AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: .back),
+              let ultrawideDevice = AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back) else {
+            DispatchQueue.main.async { self.setupError = "Required cameras not available on this device." }
+            configureSingleCameraSession(deviceType: .builtInUltraWideCamera, withDepth: false)
+            return
+        }
+
+        guard CaptureCapabilityProbe.multiCamDepthPlusUltrawideSupported(lidarDevice: lidarDevice, ultrawideDevice: ultrawideDevice) else {
+            DispatchQueue.main.async { self.setupError = "This device can't run LiDAR depth + ultrawide video simultaneously - using video only." }
+            configureSingleCameraSession(deviceType: .builtInUltraWideCamera, withDepth: false)
+            return
+        }
+
+        let newSession = AVCaptureMultiCamSession()
+        newSession.beginConfiguration()
+
+        do {
+            let lidarInput = try AVCaptureDeviceInput(device: lidarDevice)
+            let ultrawideInput = try AVCaptureDeviceInput(device: ultrawideDevice)
+
+            guard newSession.canAddInput(lidarInput), newSession.canAddInput(ultrawideInput) else {
+                newSession.commitConfiguration()
+                throw MultiCamSetupError.generic("Cannot add multi-cam inputs.")
+            }
+            newSession.addInputWithNoConnections(lidarInput)
+            newSession.addInputWithNoConnections(ultrawideInput)
+
+            let videoOutput = AVCaptureVideoDataOutput()
+            guard newSession.canAddOutput(videoOutput) else {
+                newSession.commitConfiguration()
+                throw MultiCamSetupError.generic("Cannot add video output.")
+            }
+            newSession.addOutputWithNoConnections(videoOutput)
+
+            guard let ultrawidePort = ultrawideInput.ports(for: .video,
+                                                             sourceDeviceType: ultrawideDevice.deviceType,
+                                                             sourceDevicePosition: .back).first else {
+                newSession.commitConfiguration()
+                throw MultiCamSetupError.generic("No video port on ultrawide input.")
+            }
+            let videoConnection = AVCaptureConnection(inputPorts: [ultrawidePort], output: videoOutput)
+            guard newSession.canAddConnection(videoConnection) else {
+                newSession.commitConfiguration()
+                throw MultiCamSetupError.generic("Cannot connect ultrawide video.")
+            }
+            newSession.addConnection(videoConnection)
+
+            let depthOutput = AVCaptureDepthDataOutput()
+            depthOutput.isFilteringEnabled = false
+            guard newSession.canAddOutput(depthOutput) else {
+                newSession.commitConfiguration()
+                throw MultiCamSetupError.generic("Cannot add depth output.")
+            }
+            newSession.addOutputWithNoConnections(depthOutput)
+
+            guard let lidarDepthPort = lidarInput.ports(for: .depthData,
+                                                          sourceDeviceType: lidarDevice.deviceType,
+                                                          sourceDevicePosition: .back).first else {
+                newSession.commitConfiguration()
+                throw MultiCamSetupError.generic("No depth port on LiDAR input.")
+            }
+            let depthConnection = AVCaptureConnection(inputPorts: [lidarDepthPort], output: depthOutput)
+            guard newSession.canAddConnection(depthConnection) else {
+                newSession.commitConfiguration()
+                throw MultiCamSetupError.generic("Cannot connect LiDAR depth.")
+            }
+            newSession.addConnection(depthConnection)
+
+            selectDepthFormat(for: lidarDevice)
+
+            let synchronizer = AVCaptureDataOutputSynchronizer(dataOutputs: [videoOutput, depthOutput])
+            synchronizer.setDelegate(self, queue: dataOutputQueue)
+
+            let hardwareCost = Double(newSession.hardwareCost)
+            let systemPressureCost = Double(newSession.systemPressureCost)
+
+            newSession.commitConfiguration()
+
+            DispatchQueue.main.async {
+                self.lastHardwareCost = hardwareCost
+                self.lastSystemPressureCost = systemPressureCost
+            }
+
+            guard hardwareCost < 1.0, systemPressureCost < 1.0 else {
+                DispatchQueue.main.async {
+                    self.setupError = String(format: "Multi-cam over budget (hardwareCost %.2f, systemPressureCost %.2f) - falling back to video only.", hardwareCost, systemPressureCost)
+                }
+                configureSingleCameraSession(deviceType: .builtInUltraWideCamera, withDepth: false)
+                return
+            }
+
+            self.videoDataOutput = videoOutput
+            self.depthDataOutput = depthOutput
+            self.outputSynchronizer = synchronizer
+            self.session = newSession
+
+            setUpRotationCoordinator(device: ultrawideDevice)
+
+            DispatchQueue.main.async {
+                self.isConfigured = true
+                self.depthAvailable = true
+            }
+        } catch {
+            let message = (error as? MultiCamSetupError)?.message ?? error.localizedDescription
+            DispatchQueue.main.async { self.setupError = "Multi-cam setup failed: \(message) - using video only." }
+            configureSingleCameraSession(deviceType: .builtInUltraWideCamera, withDepth: false)
+        }
+    }
+
+    private enum MultiCamSetupError: Error {
+        case generic(String)
+        var message: String {
+            switch self { case .generic(let m): return m }
+        }
+    }
+
+    private func selectDepthFormat(for device: AVCaptureDevice) {
+        guard let depthFormat = device.activeFormat.supportedDepthDataFormats.first(where: {
+            CMFormatDescriptionGetMediaSubType($0.formatDescription) == kCVPixelFormatType_DepthFloat32
+        }) else { return }
+
+        do {
+            try device.lockForConfiguration()
+            device.activeDepthDataFormat = depthFormat
+            device.unlockForConfiguration()
+        } catch {
+            DispatchQueue.main.async { self.setupError = "Depth format config error: \(error.localizedDescription)" }
+        }
     }
 
     private func setUpRotationCoordinator(device: AVCaptureDevice) {
@@ -140,8 +318,9 @@ final class CaptureSessionController: NSObject, ObservableObject {
 
     func startRunning() {
         guard !session.isRunning else { return }
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.session.startRunning()
+        let sessionToStart = session
+        DispatchQueue.global(qos: .userInitiated).async {
+            sessionToStart.startRunning()
         }
     }
 
@@ -154,15 +333,18 @@ final class CaptureSessionController: NSObject, ObservableObject {
 extension CaptureSessionController: AVCaptureDataOutputSynchronizerDelegate {
     func dataOutputSynchronizer(_ synchronizer: AVCaptureDataOutputSynchronizer,
                                  didOutput synchronizedDataCollection: AVCaptureSynchronizedDataCollection) {
-        guard let videoOutput = videoDataOutput, let depthOutput = depthDataOutput else { return }
+        guard let videoOutput = videoDataOutput else { return }
 
         guard let syncedVideoData = synchronizedDataCollection.synchronizedData(for: videoOutput)
                 as? AVCaptureSynchronizedSampleBufferData,
               !syncedVideoData.sampleBufferWasDropped else { return }
 
-        let syncedDepthData = synchronizedDataCollection.synchronizedData(for: depthOutput)
-                as? AVCaptureSynchronizedDepthData
-        let depthData = (syncedDepthData?.depthDataWasDropped == false) ? syncedDepthData?.depthData : nil
+        var depthData: AVDepthData?
+        if let depthOutput = depthDataOutput,
+           let syncedDepthData = synchronizedDataCollection.synchronizedData(for: depthOutput) as? AVCaptureSynchronizedDepthData,
+           !syncedDepthData.depthDataWasDropped {
+            depthData = syncedDepthData.depthData
+        }
 
         frameSink?.captureController(self, didOutput: syncedVideoData.sampleBuffer, depthData: depthData)
     }
