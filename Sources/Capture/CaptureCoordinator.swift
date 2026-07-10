@@ -26,6 +26,7 @@ final class CaptureCoordinator: NSObject, ObservableObject, CaptureFrameSink {
             statusMessage = "Failed to create session folder"
             return
         }
+        sessionController.lockRotationForRecording()
         self.recordingSession = recordingSession
         videoFrameCount = 0
         depthFrameCount = 0
@@ -39,6 +40,7 @@ final class CaptureCoordinator: NSObject, ObservableObject, CaptureFrameSink {
         recordingSession.finish { [weak self] in
             DispatchQueue.main.async {
                 self?.statusMessage = "Saved to \(recordingSession.folder.name)"
+                self?.sessionController.unlockRotationAfterRecording()
             }
         }
         self.recordingSession = nil

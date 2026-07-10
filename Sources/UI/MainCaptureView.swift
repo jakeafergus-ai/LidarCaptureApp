@@ -8,7 +8,7 @@ struct MainCaptureView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            CameraPreviewView(session: coordinator.sessionController.session)
+            CameraPreviewView(controller: coordinator.sessionController)
                 .ignoresSafeArea()
 
             VStack {

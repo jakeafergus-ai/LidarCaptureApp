@@ -13,10 +13,17 @@ final class CaptureSessionController: NSObject, ObservableObject {
     private var depthDataOutput: AVCaptureDepthDataOutput?
     private var outputSynchronizer: AVCaptureDataOutputSynchronizer?
 
+    private var device: AVCaptureDevice?
+    private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
+    private var captureAngleObservation: NSKeyValueObservation?
+    private var previewAngleObservation: NSKeyValueObservation?
+    private var isRotationLockedForRecording = false
+
     weak var frameSink: CaptureFrameSink?
 
     @Published var isConfigured = false
     @Published var setupError: String?
+    @Published var previewRotationAngle: CGFloat = 90
 
     func requestPermissionAndConfigure() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
@@ -44,6 +51,7 @@ final class CaptureSessionController: NSObject, ObservableObject {
             DispatchQueue.main.async { self.setupError = "LiDAR camera not available on this device." }
             return
         }
+        self.device = device
 
         do {
             let input = try AVCaptureDeviceInput(device: device)
@@ -90,7 +98,44 @@ final class CaptureSessionController: NSObject, ObservableObject {
         synchronizer.setDelegate(self, queue: dataOutputQueue)
         self.outputSynchronizer = synchronizer
 
+        setUpRotationCoordinator(device: device)
+
         DispatchQueue.main.async { self.isConfigured = true }
+    }
+
+    private func setUpRotationCoordinator(device: AVCaptureDevice) {
+        let coordinator = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: nil)
+        rotationCoordinator = coordinator
+
+        captureAngleObservation = coordinator.observe(\.videoRotationAngleForHorizonLevelCapture, options: [.initial, .new]) { [weak self] coordinator, _ in
+            self?.applyCaptureRotationAngle(coordinator.videoRotationAngleForHorizonLevelCapture)
+        }
+        previewAngleObservation = coordinator.observe(\.videoRotationAngleForHorizonLevelPreview, options: [.initial, .new]) { [weak self] coordinator, _ in
+            DispatchQueue.main.async {
+                self?.previewRotationAngle = coordinator.videoRotationAngleForHorizonLevelPreview
+            }
+        }
+    }
+
+    private func applyCaptureRotationAngle(_ angle: CGFloat) {
+        guard !isRotationLockedForRecording else { return }
+        guard let connection = videoDataOutput?.connection(with: .video),
+              connection.isVideoRotationAngleSupported(angle) else { return }
+        connection.videoRotationAngle = angle
+    }
+
+    /// Freezes the recorded video's orientation at whatever the device's current
+    /// rotation is. Called right as a recording starts so mid-clip rotation doesn't
+    /// tilt the file; live tracking resumes once the clip finishes.
+    func lockRotationForRecording() {
+        isRotationLockedForRecording = true
+    }
+
+    func unlockRotationAfterRecording() {
+        isRotationLockedForRecording = false
+        if let angle = rotationCoordinator?.videoRotationAngleForHorizonLevelCapture {
+            applyCaptureRotationAngle(angle)
+        }
     }
 
     func startRunning() {
