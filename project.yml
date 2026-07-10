@@ -37,9 +37,6 @@ targets:
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         UIRequiresFullScreen: true
-    entitlements:
-      path: Sources/App/LidarCaptureApp.entitlements
-      properties: {}
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.jakefergus.lidarcaptureapp
@@ -50,9 +47,6 @@ targets:
     scheme:
       testTargets:
         - LidarCaptureAppTests
-      configVariants:
-        - Debug
-        - Release
 
   LidarCaptureAppTests:
     type: bundle.unit-test
