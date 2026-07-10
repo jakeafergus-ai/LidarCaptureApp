@@ -1,0 +1,52 @@
+name: Build Unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show available Xcode versions
+        run: ls /Applications | grep Xcode
+
+      - name: Select latest available Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -n 1)/Contents/Developer"
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build unsigned archive
+        run: |
+          xcodebuild archive \
+            -project LidarCaptureApp.xcodeproj \
+            -scheme LidarCaptureApp \
+            -configuration Release \
+            -archivePath build/LidarCaptureApp.xcarchive \
+            -destination "generic/platform=iOS" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_STYLE=Manual \
+            DEVELOPMENT_TEAM=""
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p build/Payload
+          cp -R build/LidarCaptureApp.xcarchive/Products/Applications/LidarCaptureApp.app build/Payload/
+          cd build
+          zip -r LidarCaptureApp-unsigned.ipa Payload
+          cd ..
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LidarCaptureApp-unsigned-ipa
+          path: build/LidarCaptureApp-unsigned.ipa
+          retention-days: 14
