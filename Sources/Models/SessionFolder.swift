@@ -5,6 +5,7 @@ struct SessionFolder {
     let name: String
 
     var videoURL: URL { rootURL.appendingPathComponent("video.mov") }
+    var wideVideoURL: URL { rootURL.appendingPathComponent("wide.mov") }
     var depthFolderURL: URL { rootURL.appendingPathComponent("depth", isDirectory: true) }
     var manifestURL: URL { rootURL.appendingPathComponent("manifest.json") }
 

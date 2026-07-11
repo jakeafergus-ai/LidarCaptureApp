@@ -3,12 +3,15 @@ import AVFoundation
 final class RecordingSession {
     let folder: SessionFolder
     private(set) var frameCount = 0
+    private(set) var companionFrameCount = 0
     private(set) var depthFrameCount = 0
 
     private let videoWriter = VideoWriter()
+    private let companionWriter = VideoWriter()
     private let depthWriter: DepthSidecarWriter
     private let startedAt = Date()
     private var started = false
+    private var companionStarted = false
     private let extraMetadata: [String: Any]
 
     init?(sessionName: String, extraMetadata: [String: Any] = [:]) {
@@ -34,10 +37,27 @@ final class RecordingSession {
         frameCount += 1
     }
 
-    // Depth is written on its own clock, independent of video frames: in 0.5x
-    // mode depth (wide camera) and video (ultrawide) tick at unrelated times, so
-    // depth must never be gated on a video frame arriving alongside it. Both
-    // streams share the session clock, so timestamps stay comparable downstream.
+    // Wide (1x) reference video in 0.5x mode - registered to the depth stream
+    // since both come from the LiDAR device.
+    func handleCompanionVideo(sampleBuffer: CMSampleBuffer) {
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
+
+        if !companionStarted {
+            do {
+                try companionWriter.start(outputURL: folder.wideVideoURL, formatDescription: formatDescription)
+                companionStarted = true
+            } catch {
+                return
+            }
+        }
+
+        companionWriter.append(sampleBuffer)
+        companionFrameCount += 1
+    }
+
+    // Depth is written on its own clock, never gated on a video frame arriving
+    // alongside it. All streams share the session clock, so timestamps stay
+    // comparable downstream.
     func handleDepth(depthData: AVDepthData, timestamp: CMTime) {
         depthWriter.write(depthData, timestamp: timestamp)
         depthFrameCount = depthWriter.frameCount
@@ -45,8 +65,14 @@ final class RecordingSession {
 
     func finish(completion: @escaping () -> Void) {
         videoWriter.finish { [weak self] in
-            self?.writeManifest()
-            completion()
+            guard let self else {
+                completion()
+                return
+            }
+            self.companionWriter.finish {
+                self.writeManifest()
+                completion()
+            }
         }
     }
 
@@ -56,6 +82,7 @@ final class RecordingSession {
             "startedAt": ISO8601DateFormatter().string(from: startedAt),
             "finishedAt": ISO8601DateFormatter().string(from: Date()),
             "videoFrameCount": frameCount,
+            "companionVideoFrameCount": companionFrameCount,
             "depthFrameCount": depthFrameCount
         ]
         for (key, value) in extraMetadata {

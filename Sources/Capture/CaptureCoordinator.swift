@@ -68,8 +68,17 @@ final class CaptureCoordinator: NSObject, ObservableObject, CaptureFrameSink {
         }
     }
 
+    func captureController(_ controller: CaptureSessionController, didOutputCompanionVideo sampleBuffer: CMSampleBuffer) {
+        guard isRecording, let recordingSession else { return }
+        recordingSession.handleCompanionVideo(sampleBuffer: sampleBuffer)
+    }
+
     func captureController(_ controller: CaptureSessionController, didOutputDepth depthData: AVDepthData, timestamp: CMTime) {
         guard isRecording, let recordingSession else { return }
         recordingSession.handleDepth(depthData: depthData, timestamp: timestamp)
+
+        DispatchQueue.main.async {
+            self.depthFrameCount = recordingSession.depthFrameCount
+        }
     }
 }

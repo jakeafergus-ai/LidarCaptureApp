@@ -3,20 +3,14 @@ import CoreVideo
 
 protocol CaptureFrameSink: AnyObject {
     func captureController(_ controller: CaptureSessionController, didOutputVideo sampleBuffer: CMSampleBuffer)
+    func captureController(_ controller: CaptureSessionController, didOutputCompanionVideo sampleBuffer: CMSampleBuffer)
     func captureController(_ controller: CaptureSessionController, didOutputDepth depthData: AVDepthData, timestamp: CMTime)
 }
-
-/// Consumes and discards the LiDAR device's companion wide-video frames in 0.5x
-/// mode. That stream is never recorded - it exists only because depth generation
-/// rides on the device's video pipeline, which doesn't run without a consumer.
-private final class DiscardingVideoDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {}
 
 final class CaptureSessionController: NSObject, ObservableObject {
     @Published private(set) var session: AVCaptureSession = AVCaptureSession()
     let previewLayer = AVCaptureVideoPreviewLayer()
     private let dataOutputQueue = DispatchQueue(label: "capture.dataOutputQueue", qos: .userInitiated)
-    private let discardQueue = DispatchQueue(label: "capture.discardQueue", qos: .utility)
-    private let discardDelegate = DiscardingVideoDelegate()
 
     private var videoDataOutput: AVCaptureVideoDataOutput?
     private var depthDataOutput: AVCaptureDepthDataOutput?
@@ -26,6 +20,7 @@ final class CaptureSessionController: NSObject, ObservableObject {
     // Diagnostics for the 0.5x depth investigation - updated on dataOutputQueue,
     // mirrored to diagSummary on main every ~30 video callbacks.
     private var diagVideoCallbackCount = 0
+    private var diagCompanionCallbackCount = 0
     private var diagDepthPresentCount = 0
     private var diagDepthDroppedCount = 0
     private var diagCollectionCount = 0
@@ -90,6 +85,13 @@ final class CaptureSessionController: NSObject, ObservableObject {
         captureAngleObservation = nil
         previewAngleObservation = nil
         rotationCoordinator = nil
+
+        // Detach the preview layer from any previous session before rebuilding.
+        // A preview layer still holding a connection into the old session makes
+        // the new multicam session reject its explicit preview connection, which
+        // silently degraded 0.5x to the video-only fallback depending on how the
+        // lens modes had been toggled before.
+        previewLayer.session = nil
 
         switch mode {
         case .wide1x:
@@ -239,9 +241,14 @@ final class CaptureSessionController: NSObject, ObservableObject {
                 throw MultiCamSetupError.generic("Cannot connect ultrawide video.")
             }
             newSession.addConnection(videoConnection)
+            // Primary ultrawide video is delivered via its own plain delegate, not
+            // the synchronizer: the synchronizer is reserved for the LiDAR device's
+            // same-device video+depth pairing (the topology proven to work in 1x).
+            videoOutput.setSampleBufferDelegate(self, queue: dataOutputQueue)
 
             // Preview layer needs its own explicit connection to the same port -
             // one physical port can feed both the data output and the preview.
+            previewLayer.setSessionWithNoConnection(newSession)
             let previewConnection = AVCaptureConnection(inputPort: ultrawidePort, videoPreviewLayer: previewLayer)
             guard newSession.canAddConnection(previewConnection) else {
                 newSession.commitConfiguration()
@@ -270,11 +277,11 @@ final class CaptureSessionController: NSObject, ObservableObject {
             }
             newSession.addConnection(depthConnection)
 
-            // Companion wide-video stream from the LiDAR device. Never recorded -
-            // depth generation is slaved to the device's video pipeline, and with
-            // only the depth port connected that pipeline never runs, so no depth
-            // frames are ever produced (observed on-device: session configures
-            // with valid costs but zero depth callbacks).
+            // Wide (1x) companion video from the LiDAR device, recorded to disk as
+            // a reference stream registered to the depth data. Depth generation
+            // rides this device's video pipeline, and pairing depth with video
+            // from the same device through the synchronizer reproduces the exact
+            // topology that works reliably in 1x mode.
             guard let lidarVideoPort = lidarInput.ports(for: .video,
                                                           sourceDeviceType: lidarDevice.deviceType,
                                                           sourceDevicePosition: .back).first else {
@@ -282,7 +289,6 @@ final class CaptureSessionController: NSObject, ObservableObject {
                 throw MultiCamSetupError.generic("No video port on LiDAR input.")
             }
             let companionOutput = AVCaptureVideoDataOutput()
-            companionOutput.alwaysDiscardsLateVideoFrames = true
             guard newSession.canAddOutput(companionOutput) else {
                 newSession.commitConfiguration()
                 throw MultiCamSetupError.generic("Cannot add LiDAR companion video output.")
@@ -294,9 +300,8 @@ final class CaptureSessionController: NSObject, ObservableObject {
                 throw MultiCamSetupError.generic("Cannot connect LiDAR companion video.")
             }
             newSession.addConnection(companionConnection)
-            companionOutput.setSampleBufferDelegate(discardDelegate, queue: discardQueue)
 
-            let synchronizer = AVCaptureDataOutputSynchronizer(dataOutputs: [videoOutput, depthOutput])
+            let synchronizer = AVCaptureDataOutputSynchronizer(dataOutputs: [companionOutput, depthOutput])
             synchronizer.setDelegate(self, queue: dataOutputQueue)
 
             let hardwareCost = Double(newSession.hardwareCost)
@@ -326,10 +331,10 @@ final class CaptureSessionController: NSObject, ObservableObject {
             self.lidarCompanionVideoOutput = companionOutput
             self.outputSynchronizer = synchronizer
             self.session = newSession
-            previewLayer.setSessionWithNoConnection(newSession)
 
             dataOutputQueue.async {
                 self.diagVideoCallbackCount = 0
+                self.diagCompanionCallbackCount = 0
                 self.diagDepthPresentCount = 0
                 self.diagDepthDroppedCount = 0
                 self.diagCollectionCount = 0
@@ -381,9 +386,10 @@ final class CaptureSessionController: NSObject, ObservableObject {
     /// 0.5x path: a device inside a multicam session can only use formats marked
     /// isMultiCamSupported, so the intersection of multicam-compatible and
     /// depth-capable is required. Among eligible formats the smallest resolution
-    /// wins - the wide video stream is discarded anyway, so spending ISP bandwidth
-    /// on it just burns hardware-cost budget. Also records format counts into the
-    /// diagnostics string so on-device results show exactly what was available.
+    /// wins - the wide stream is only a depth-registered reference video, and
+    /// larger formats burn hardware-cost budget the ultrawide stream needs. Also
+    /// records format counts into the diagnostics string so on-device results
+    /// show exactly what was available.
     private func selectMultiCamDepthFormat(for device: AVCaptureDevice) -> Bool {
         let allFormats = device.formats
         let multiCamFormats = allFormats.filter { $0.isMultiCamSupported }
@@ -449,9 +455,14 @@ final class CaptureSessionController: NSObject, ObservableObject {
 
     private func applyCaptureRotationAngle(_ angle: CGFloat) {
         guard !isRotationLockedForRecording else { return }
-        guard let connection = videoDataOutput?.connection(with: .video),
-              connection.isVideoRotationAngleSupported(angle) else { return }
-        connection.videoRotationAngle = angle
+        // Both recorded video streams (primary + wide companion, when present)
+        // get the same rotation so the files match orientation.
+        for output in [videoDataOutput, lidarCompanionVideoOutput] {
+            if let connection = output?.connection(with: .video),
+               connection.isVideoRotationAngleSupported(angle) {
+                connection.videoRotationAngle = angle
+            }
+        }
     }
 
     /// Freezes the recorded video's orientation at whatever the device's current
@@ -483,13 +494,10 @@ final class CaptureSessionController: NSObject, ObservableObject {
 }
 
 extension CaptureSessionController: AVCaptureDataOutputSynchronizerDelegate {
-    // Video and depth are delivered to the sink independently: in 0.5x mode they
-    // come from different physical cameras whose frame timing rarely coincides,
-    // so the synchronizer usually delivers depth in collections that contain no
-    // ultrawide video frame at all. Requiring both in one collection silently
-    // discards every depth frame (observed on-device: depth callbacks counted,
-    // zero depth files written). Both devices share the session clock, so the
-    // per-stream timestamps remain comparable for downstream alignment.
+    // The synchronizer always pairs same-device streams: video+depth from the
+    // LiDAR device (primary video in 1x mode, wide companion video in 0.5x mode).
+    // Same device means aligned timestamps, so collections reliably contain both.
+    // Depth is still forwarded on its own timestamp, never gated on video.
     func dataOutputSynchronizer(_ synchronizer: AVCaptureDataOutputSynchronizer,
                                  didOutput synchronizedDataCollection: AVCaptureSynchronizedDataCollection) {
         if let depthOutput = depthDataOutput,
@@ -502,17 +510,34 @@ extension CaptureSessionController: AVCaptureDataOutputSynchronizerDelegate {
             }
         }
 
-        if let videoOutput = videoDataOutput,
-           let syncedVideoData = synchronizedDataCollection.synchronizedData(for: videoOutput) as? AVCaptureSynchronizedSampleBufferData,
-           !syncedVideoData.sampleBufferWasDropped {
+        // 1x mode: the LiDAR device's video is the primary recorded stream.
+        if let companionOutput = lidarCompanionVideoOutput {
+            if let syncedCompanion = synchronizedDataCollection.synchronizedData(for: companionOutput) as? AVCaptureSynchronizedSampleBufferData,
+               !syncedCompanion.sampleBufferWasDropped {
+                diagCompanionCallbackCount += 1
+                frameSink?.captureController(self, didOutputCompanionVideo: syncedCompanion.sampleBuffer)
+            }
+        } else if let videoOutput = videoDataOutput,
+                  let syncedVideoData = synchronizedDataCollection.synchronizedData(for: videoOutput) as? AVCaptureSynchronizedSampleBufferData,
+                  !syncedVideoData.sampleBufferWasDropped {
             diagVideoCallbackCount += 1
             frameSink?.captureController(self, didOutputVideo: syncedVideoData.sampleBuffer)
         }
 
         diagCollectionCount += 1
         if diagCollectionCount % 30 == 0 {
-            let summary = "\(diagConfigSummary) | cb v \(diagVideoCallbackCount) d \(diagDepthPresentCount) drop \(diagDepthDroppedCount)"
+            let summary = "\(diagConfigSummary) | cb v \(diagVideoCallbackCount) w \(diagCompanionCallbackCount) d \(diagDepthPresentCount) drop \(diagDepthDroppedCount)"
             DispatchQueue.main.async { self.diagSummary = summary }
         }
+    }
+}
+
+extension CaptureSessionController: AVCaptureVideoDataOutputSampleBufferDelegate {
+    // 0.5x mode only: the primary ultrawide stream arrives through its own plain
+    // delegate, independent of the LiDAR device's synchronizer.
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard output === videoDataOutput else { return }
+        diagVideoCallbackCount += 1
+        frameSink?.captureController(self, didOutputVideo: sampleBuffer)
     }
 }
