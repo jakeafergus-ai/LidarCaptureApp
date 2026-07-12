@@ -31,6 +31,9 @@ final class CaptureSessionController: NSObject, ObservableObject {
     private var previewAngleObservation: NSKeyValueObservation?
     private var isRotationLockedForRecording = false
     private var hasPermission = false
+    private var sessionObservers: [NSObjectProtocol] = []
+    private var snapshotTimer: DispatchSourceTimer?
+    private var activeDepthConnection: AVCaptureConnection?
 
     weak var frameSink: CaptureFrameSink?
 
@@ -52,6 +55,12 @@ final class CaptureSessionController: NSObject, ObservableObject {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
             hasPermission = true
+            // onAppear can fire more than once; rebuilding a session that is
+            // already up tears down a healthy configuration mid-flight.
+            if isConfigured && session.isRunning {
+                DebugLog.shared.log("configure skipped - already configured and running")
+                return
+            }
             configureSession(for: lensMode)
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
@@ -70,6 +79,7 @@ final class CaptureSessionController: NSObject, ObservableObject {
 
     func switchLensMode(to newMode: LensMode) {
         guard newMode != lensMode else { return }
+        DebugLog.shared.log("switchLensMode -> \(newMode)")
         let wasRunning = session.isRunning
         if wasRunning { session.stopRunning() }
         lensMode = newMode
@@ -80,6 +90,8 @@ final class CaptureSessionController: NSObject, ObservableObject {
     }
 
     private func configureSession(for mode: LensMode) {
+        DebugLog.shared.log("configureSession mode=\(mode) sessionRunning=\(session.isRunning) isConfigured=\(isConfigured)")
+
         captureAngleObservation?.invalidate()
         previewAngleObservation?.invalidate()
         captureAngleObservation = nil
@@ -164,7 +176,11 @@ final class CaptureSessionController: NSObject, ObservableObject {
         self.lidarCompanionVideoOutput = nil
         self.outputSynchronizer = synchronizer
         self.session = newSession
+        self.activeDepthConnection = depthOutput?.connection(with: .depthData)
         previewLayer.session = newSession
+        attachSessionObservers(to: newSession)
+        startSnapshotTimer()
+        DebugLog.shared.log("single-cam configured: device=\(device.localizedName) withDepth=\(withDepth) depthFormatSelected=\(depthFormatSelected)")
 
         setUpRotationCoordinator(device: device)
 
@@ -195,6 +211,7 @@ final class CaptureSessionController: NSObject, ObservableObject {
         }
 
         guard CaptureCapabilityProbe.multiCamDepthPlusUltrawideSupported(lidarDevice: lidarDevice, ultrawideDevice: ultrawideDevice) else {
+            DebugLog.shared.log("multicam probe FAILED: device set not in supportedMultiCamDeviceSets - falling back")
             DispatchQueue.main.async { self.setupError = "This device can't run LiDAR depth + ultrawide video simultaneously - using video only." }
             configureSingleCameraSession(deviceType: .builtInUltraWideCamera, withDepth: false)
             return
@@ -219,7 +236,8 @@ final class CaptureSessionController: NSObject, ObservableObject {
             // device is part of a multicam session, and the depth pairing lives on
             // the video format, not a separate setting - so this has to happen
             // before any connection depending on this device's current format exists.
-            let depthFormatSelected = selectMultiCamDepthFormat(for: lidarDevice)
+            let chosenDepthPair = selectMultiCamDepthFormat(for: lidarDevice)
+            let depthFormatSelected = chosenDepthPair != nil
 
             guard let ultrawidePort = ultrawideInput.ports(for: .video,
                                                              sourceDeviceType: ultrawideDevice.deviceType,
@@ -309,9 +327,21 @@ final class CaptureSessionController: NSObject, ObservableObject {
 
             newSession.commitConfiguration()
 
+            // Committing a multicam configuration can silently renegotiate device
+            // formats, clearing an activeDepthDataFormat that was set beforehand -
+            // which leaves the wide camera streaming video with no depth at all.
+            // Verify it survived and re-apply if the commit reset it.
+            DebugLog.shared.log("post-commit depthFormat=\(lidarDevice.activeDepthDataFormat.map { String(describing: $0) } ?? "NIL")")
+            if lidarDevice.activeDepthDataFormat == nil, let pair = chosenDepthPair {
+                let reapplied = apply(format: pair.videoFormat, depthFormat: pair.depthFormat, to: lidarDevice)
+                DebugLog.shared.log("depth format was reset at commit - re-apply result=\(reapplied) now=\(lidarDevice.activeDepthDataFormat.map { String(describing: $0) } ?? "NIL")")
+                diagConfigSummary += reapplied ? " | REAPPLIED" : " | REAPPLY FAILED"
+            }
+
             let depthConnectionActive = depthConnection.isActive
             diagConfigSummary += String(format: " | depthConn %@ | hw %.2f pr %.2f", depthConnectionActive ? "active" : "INACTIVE", hardwareCost, systemPressureCost)
             publishDiagSummary()
+            DebugLog.shared.log("multicam configured: \(diagConfigSummary)")
 
             DispatchQueue.main.async {
                 self.lastHardwareCost = hardwareCost
@@ -319,6 +349,7 @@ final class CaptureSessionController: NSObject, ObservableObject {
             }
 
             guard hardwareCost < 1.0, systemPressureCost < 1.0 else {
+                DebugLog.shared.log(String(format: "multicam OVER BUDGET hw %.2f pr %.2f - falling back", hardwareCost, systemPressureCost))
                 DispatchQueue.main.async {
                     self.setupError = String(format: "Multi-cam over budget (hardwareCost %.2f, systemPressureCost %.2f) - falling back to video only.", hardwareCost, systemPressureCost)
                 }
@@ -331,6 +362,9 @@ final class CaptureSessionController: NSObject, ObservableObject {
             self.lidarCompanionVideoOutput = companionOutput
             self.outputSynchronizer = synchronizer
             self.session = newSession
+            self.activeDepthConnection = depthConnection
+            attachSessionObservers(to: newSession)
+            startSnapshotTimer()
 
             dataOutputQueue.async {
                 self.diagVideoCallbackCount = 0
@@ -351,6 +385,7 @@ final class CaptureSessionController: NSObject, ObservableObject {
             }
         } catch {
             let message = (error as? MultiCamSetupError)?.message ?? error.localizedDescription
+            DebugLog.shared.log("multicam setup FAILED: \(message) - falling back to ultrawide video-only")
             DispatchQueue.main.async { self.setupError = "Multi-cam setup failed: \(message) - using video only." }
             configureSingleCameraSession(deviceType: .builtInUltraWideCamera, withDepth: false)
         }
@@ -390,7 +425,7 @@ final class CaptureSessionController: NSObject, ObservableObject {
     /// larger formats burn hardware-cost budget the ultrawide stream needs. Also
     /// records format counts into the diagnostics string so on-device results
     /// show exactly what was available.
-    private func selectMultiCamDepthFormat(for device: AVCaptureDevice) -> Bool {
+    private func selectMultiCamDepthFormat(for device: AVCaptureDevice) -> (videoFormat: AVCaptureDevice.Format, depthFormat: AVCaptureDevice.Format)? {
         let allFormats = device.formats
         let multiCamFormats = allFormats.filter { $0.isMultiCamSupported }
         let depthCapable = allFormats.filter { float32DepthFormat(in: $0) != nil }
@@ -406,7 +441,8 @@ final class CaptureSessionController: NSObject, ObservableObject {
 
         guard let chosenFormat, let depthFormat = float32DepthFormat(in: chosenFormat) else {
             publishDiagSummary()
-            return false
+            DebugLog.shared.log("no eligible multicam depth format: \(diagConfigSummary)")
+            return nil
         }
 
         let dims = CMVideoFormatDescriptionGetDimensions(chosenFormat.formatDescription)
@@ -416,7 +452,46 @@ final class CaptureSessionController: NSObject, ObservableObject {
         let applied = apply(format: chosenFormat, depthFormat: depthFormat, to: device)
         if !applied { diagConfigSummary += " | APPLY FAILED" }
         publishDiagSummary()
-        return applied
+        return applied ? (chosenFormat, depthFormat) : nil
+    }
+
+    private func attachSessionObservers(to session: AVCaptureSession) {
+        for observer in sessionObservers { NotificationCenter.default.removeObserver(observer) }
+        sessionObservers = []
+
+        let center = NotificationCenter.default
+        let events: [(Notification.Name, String)] = [
+            (AVCaptureSession.runtimeErrorNotification, "runtimeError"),
+            (AVCaptureSession.wasInterruptedNotification, "wasInterrupted"),
+            (AVCaptureSession.interruptionEndedNotification, "interruptionEnded"),
+            (AVCaptureSession.didStartRunningNotification, "didStartRunning"),
+            (AVCaptureSession.didStopRunningNotification, "didStopRunning")
+        ]
+        for (name, label) in events {
+            sessionObservers.append(center.addObserver(forName: name, object: session, queue: nil) { note in
+                var detail = ""
+                if let error = note.userInfo?[AVCaptureSessionErrorKey] as? AVError {
+                    detail += " error=\(error.code.rawValue) \(error.localizedDescription)"
+                }
+                if let reason = note.userInfo?[AVCaptureSessionInterruptionReasonKey] {
+                    detail += " reason=\(reason)"
+                }
+                DebugLog.shared.log("session \(label)\(detail)")
+            })
+        }
+    }
+
+    private func startSnapshotTimer() {
+        snapshotTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: dataOutputQueue)
+        timer.schedule(deadline: .now() + 2, repeating: 2)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let depthActive = self.activeDepthConnection?.isActive ?? false
+            DebugLog.shared.log("snapshot running=\(self.session.isRunning) v=\(self.diagVideoCallbackCount) w=\(self.diagCompanionCallbackCount) d=\(self.diagDepthPresentCount) drop=\(self.diagDepthDroppedCount) depthConnActive=\(depthActive)")
+        }
+        timer.resume()
+        snapshotTimer = timer
     }
 
     private func apply(format: AVCaptureDevice.Format, depthFormat: AVCaptureDevice.Format, to device: AVCaptureDevice) -> Bool {

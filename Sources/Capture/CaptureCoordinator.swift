@@ -44,11 +44,14 @@ final class CaptureCoordinator: NSObject, ObservableObject, CaptureFrameSink {
         depthFrameCount = 0
         isRecording = true
         statusMessage = "Recording: \(recordingSession.folder.name)"
+        DebugLog.shared.log("record START \(recordingSession.folder.name) depthAvailable=\(sessionController.depthAvailable) diag=\(sessionController.diagSummary)")
     }
 
     func stopRecording() {
         guard let recordingSession else { return }
         isRecording = false
+        recordingSession.stopDiagnostics = sessionController.diagSummary
+        DebugLog.shared.log("record STOP \(recordingSession.folder.name) v=\(recordingSession.frameCount) w=\(recordingSession.companionFrameCount) d=\(recordingSession.depthFrameCount) diag=\(sessionController.diagSummary)")
         recordingSession.finish { [weak self] in
             DispatchQueue.main.async {
                 self?.statusMessage = "Saved to \(recordingSession.folder.name)"

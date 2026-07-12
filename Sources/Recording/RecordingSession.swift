@@ -13,6 +13,7 @@ final class RecordingSession {
     private var started = false
     private var companionStarted = false
     private let extraMetadata: [String: Any]
+    var stopDiagnostics: String?
 
     init?(sessionName: String, extraMetadata: [String: Any] = [:]) {
         guard let folder = SessionFolder.create(sessionName: sessionName) else { return nil }
@@ -87,6 +88,9 @@ final class RecordingSession {
         ]
         for (key, value) in extraMetadata {
             manifest[key] = value
+        }
+        if let stopDiagnostics {
+            manifest["diagnosticsAtStop"] = stopDiagnostics
         }
         guard let data = try? JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted]) else { return }
         try? data.write(to: folder.manifestURL)
