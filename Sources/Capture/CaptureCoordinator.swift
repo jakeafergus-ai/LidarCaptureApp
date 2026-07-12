@@ -35,6 +35,7 @@ final class CaptureCoordinator: NSObject, ObservableObject, CaptureFrameSink {
     }
 
     func start() {
+        SessionFolder.recoverHiddenSessionFolders()
         lastAppliedSnapshot = settings.snapshot()
         sessionController.settingsSnapshot = lastAppliedSnapshot
         sessionController.requestPermissionAndConfigure()

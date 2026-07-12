@@ -491,14 +491,7 @@ final class CaptureSessionController: NSObject, ObservableObject {
             attachSessionObservers(to: newSession)
             startSnapshotTimer()
 
-            if let extrinsicsData = AVCaptureDevice.extrinsicMatrix(from: lidarDevice, to: ultrawideDevice) {
-                let floats = extrinsicsData.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-                lidarToUltrawideExtrinsics = floats.map(Double.init)
-                DebugLog.shared.log("wide->ultrawide extrinsics captured (\(floats.count) values)")
-            } else {
-                lidarToUltrawideExtrinsics = nil
-                DebugLog.shared.log("wide->ultrawide extrinsics unavailable")
-            }
+            captureExtrinsics(lidarDevice: lidarDevice, ultrawideDevice: ultrawideDevice)
 
             dataOutputQueue.async {
                 self.diagVideoCallbackCount = 0
@@ -666,6 +659,35 @@ final class CaptureSessionController: NSObject, ObservableObject {
 
     private func maxFrameRate(of format: AVCaptureDevice.Format) -> Double {
         format.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 0
+    }
+
+    /// Captures the factory-calibrated wide->ultrawide relative pose. The direct
+    /// device-to-device query can return nil (observed on-device); the constituent
+    /// devices of the dual-wide virtual camera are the documented-working path.
+    private func captureExtrinsics(lidarDevice: AVCaptureDevice, ultrawideDevice: AVCaptureDevice) {
+        func decode(_ data: Data, source: String) {
+            let floats = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+            lidarToUltrawideExtrinsics = floats.map(Double.init)
+            DebugLog.shared.log("wide->ultrawide extrinsics captured via \(source) (\(floats.count) values)")
+        }
+
+        if let data = AVCaptureDevice.extrinsicMatrix(from: lidarDevice, to: ultrawideDevice) {
+            decode(data, source: "direct query")
+            return
+        }
+
+        if let dualWide = AVCaptureDevice.default(.builtInDualWideCamera, for: .video, position: .back) {
+            let constituents = dualWide.constituentDevices
+            if let wide = constituents.first(where: { $0.deviceType == .builtInWideAngleCamera }),
+               let ultrawide = constituents.first(where: { $0.deviceType == .builtInUltraWideCamera }),
+               let data = AVCaptureDevice.extrinsicMatrix(from: wide, to: ultrawide) {
+                decode(data, source: "dualWide constituents")
+                return
+            }
+        }
+
+        lidarToUltrawideExtrinsics = nil
+        DebugLog.shared.log("wide->ultrawide extrinsics unavailable (both direct and dualWide queries returned nil)")
     }
 
     /// Explicitly constrains the ultrawide's format in multicam mode - the device
