@@ -28,32 +28,42 @@ struct MainCaptureView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            CameraPreviewView(controller: sessionController)
-                .ignoresSafeArea()
-
-            VStack(spacing: 0) {
+            VStack(spacing: 8) {
                 topBar
                     .padding(.horizontal, 12)
-                    .padding(.top, 8)
+                    .padding(.top, 4)
 
-                Spacer()
+                // Boxed, aspect-fit preview: the entire sensor frame is visible,
+                // uncovered by any controls.
+                CameraPreviewView(controller: sessionController)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.black)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                    )
+                    .padding(.horizontal, 8)
 
                 if !coordinator.isRecording {
+                    HStack {
+                        storageGauge
+                        Spacer()
+                    }
+                    .padding(.horizontal, 16)
+
                     if let expandedControl {
                         expandedPanel(for: expandedControl)
                             .padding(.horizontal, 12)
-                            .padding(.bottom, 6)
                     }
 
                     controlChipsRow
-                        .padding(.bottom, 6)
                 } else {
                     recordingStats
-                        .padding(.bottom, 6)
                 }
 
                 bottomBar
-                    .padding(.bottom, 24)
+                    .padding(.bottom, 16)
             }
         }
         .onAppear { coordinator.start() }
@@ -71,7 +81,7 @@ struct MainCaptureView: View {
         }
     }
 
-    // MARK: Top bar - session name (idle) / timer (recording) + storage/thermal HUD
+    // MARK: Top bar - session name (idle) / timer (recording) + thermal/depth HUD
 
     private var topBar: some View {
         HStack(alignment: .top) {
@@ -114,8 +124,6 @@ struct MainCaptureView: View {
 
     private var statusHUD: some View {
         VStack(alignment: .trailing, spacing: 2) {
-            Text(systemStatus.freeText)
-                .foregroundStyle(.white)
             Text(systemStatus.thermalText)
                 .foregroundStyle(thermalColor)
             if sessionController.lensMode == .ultrawide0_5x {
@@ -137,6 +145,28 @@ struct MainCaptureView: View {
         case .critical: return .red
         @unknown default: return .white
         }
+    }
+
+    // MARK: Storage gauge - bottom-left while idle, moves beside the record
+    // button while recording.
+
+    private var storageGauge: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(systemStatus.freeGBText)
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.white)
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(.white.opacity(0.25))
+                    .frame(width: 80, height: 4)
+                Capsule()
+                    .fill(systemStatus.freeFraction < 0.1 ? Color.orange : Color.green)
+                    .frame(width: max(4, 80 * systemStatus.freeFraction), height: 4)
+            }
+        }
+        .padding(8)
+        .background(.black.opacity(0.55))
+        .cornerRadius(8)
     }
 
     // MARK: Control chips (idle only)
@@ -207,12 +237,14 @@ struct MainCaptureView: View {
         VStack(spacing: 8) {
             switch control {
             case .exposure:
-                panelSlider(title: "Shutter 1/\(Int(settings.shutterDenominator))",
-                            value: $settings.shutterDenominator, range: 24...2000, step: 1) {
+                steppedSlider(title: "Shutter 1/\(Int(settings.shutterDenominator))",
+                              options: CaptureSettings.shutterOptions,
+                              value: $settings.shutterDenominator) {
                     settings.autoExposure = false
                 }
-                panelSlider(title: "ISO \(Int(settings.iso))",
-                            value: $settings.iso, range: 25...3200, step: 1) {
+                steppedSlider(title: "ISO \(Int(settings.iso))",
+                              options: CaptureSettings.isoOptions,
+                              value: $settings.iso) {
                     settings.autoExposure = false
                 }
                 panelAutoButton(isAuto: settings.autoExposure) {
@@ -237,6 +269,23 @@ struct MainCaptureView: View {
         .padding(10)
         .background(.black.opacity(0.7))
         .cornerRadius(10)
+    }
+
+    /// Slider that snaps between the given standard values (photographic stops)
+    /// instead of every integer.
+    private func steppedSlider(title: String, options: [Double], value: Binding<Double>, onEdit: @escaping () -> Void) -> some View {
+        let indexBinding = Binding<Double>(
+            get: { Double(CaptureSettings.nearestIndex(of: value.wrappedValue, in: options)) },
+            set: { value.wrappedValue = options[Int($0.rounded())] }
+        )
+        return VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.white)
+            Slider(value: indexBinding, in: 0...Double(options.count - 1), step: 1) { editing in
+                if editing { onEdit() }
+            }
+        }
     }
 
     private func panelSlider(title: String, value: Binding<Double>, range: ClosedRange<Double>, step: Double, onEdit: @escaping () -> Void) -> some View {
@@ -278,11 +327,17 @@ struct MainCaptureView: View {
         ZStack {
             recordButton
 
-            if !coordinator.isRecording {
-                HStack {
+            HStack {
+                if coordinator.isRecording {
+                    // The storage gauge takes the Files button's spot while recording.
+                    storageGauge
+                        .padding(.leading, 30)
+                } else {
                     filesButton
                         .padding(.leading, 30)
-                    Spacer()
+                }
+                Spacer()
+                if !coordinator.isRecording {
                     settingsButton
                         .padding(.trailing, 30)
                 }

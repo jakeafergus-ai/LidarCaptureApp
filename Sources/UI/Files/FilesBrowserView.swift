@@ -1,5 +1,65 @@
 import SwiftUI
 import AVKit
+import UIKit
+import Combine
+
+/// Video player with an explicit centered play/pause button - the bare
+/// VideoPlayer looks like a static thumbnail and it's unclear where to tap.
+struct VideoPlayerBox: View {
+    let url: URL
+    let height: CGFloat
+    @State private var player: AVPlayer
+    @State private var isPlaying = false
+
+    init(url: URL, height: CGFloat) {
+        self.url = url
+        self.height = height
+        _player = State(initialValue: AVPlayer(url: url))
+    }
+
+    var body: some View {
+        ZStack {
+            VideoPlayer(player: player)
+                .frame(height: height)
+
+            Button {
+                if isPlaying {
+                    player.pause()
+                } else {
+                    player.play()
+                }
+            } label: {
+                Image(systemName: isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                    .font(.system(size: 52))
+                    .foregroundStyle(.white.opacity(isPlaying ? 0.35 : 0.92))
+                    .shadow(radius: 4)
+            }
+        }
+        .onReceive(player.publisher(for: \.timeControlStatus)) { status in
+            isPlaying = status == .playing
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AVPlayerItem.didPlayToEndTimeNotification, object: player.currentItem)) { _ in
+            player.seek(to: .zero)
+            player.pause()
+        }
+        .onDisappear { player.pause() }
+    }
+}
+
+private struct ExportItem: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+private struct ActivityShareSheet: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
 
 struct SessionFolderInfo: Identifiable {
     let id: String
@@ -122,20 +182,20 @@ struct SessionDetailView: View {
     let session: SessionFolderInfo
     @State private var manifestText: String = ""
     @State private var fileRows: [(name: String, size: String)] = []
+    @State private var exportItem: ExportItem?
+    @State private var isExporting = false
 
     var body: some View {
         List {
             if session.hasVideo {
                 Section("Video") {
-                    VideoPlayer(player: AVPlayer(url: session.url.appendingPathComponent("video.mov")))
-                        .frame(height: 220)
+                    VideoPlayerBox(url: session.url.appendingPathComponent("video.mov"), height: 220)
                         .listRowInsets(EdgeInsets())
                 }
             }
             if session.hasWide {
                 Section("Wide reference (1x)") {
-                    VideoPlayer(player: AVPlayer(url: session.url.appendingPathComponent("wide.mov")))
-                        .frame(height: 160)
+                    VideoPlayerBox(url: session.url.appendingPathComponent("wide.mov"), height: 160)
                         .listRowInsets(EdgeInsets())
                 }
             }
@@ -160,7 +220,70 @@ struct SessionDetailView: View {
         }
         .navigationTitle(session.id)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button {
+                    openInFilesApp()
+                } label: {
+                    Image(systemName: "folder")
+                }
+
+                if isExporting {
+                    ProgressView()
+                } else {
+                    Button {
+                        exportZip()
+                    } label: {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                }
+            }
+        }
+        .sheet(item: $exportItem) { item in
+            ActivityShareSheet(url: item.url)
+        }
         .task { loadDetail() }
+    }
+
+    /// Jumps straight to this recording's folder in the iOS Files app.
+    private func openInFilesApp() {
+        let encodedPath = session.url.path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? session.url.path
+        if let url = URL(string: "shareddocuments://\(encodedPath)") {
+            UIApplication.shared.open(url)
+        }
+    }
+
+    /// Zips the whole session folder (via the system file coordinator, no
+    /// third-party code) and hands it to the share sheet for AirDrop/OneDrive/etc.
+    private func exportZip() {
+        isExporting = true
+        let folderURL = session.url
+        DispatchQueue.global(qos: .userInitiated).async {
+            var zippedURL: URL?
+            let coordinator = NSFileCoordinator()
+            var coordinatorError: NSError?
+            coordinator.coordinate(readingItemAt: folderURL, options: [.forUploading], error: &coordinatorError) { tempZipURL in
+                let destination = FileManager.default.temporaryDirectory
+                    .appendingPathComponent(folderURL.lastPathComponent + ".zip")
+                try? FileManager.default.removeItem(at: destination)
+                do {
+                    try FileManager.default.copyItem(at: tempZipURL, to: destination)
+                    zippedURL = destination
+                } catch {
+                    DebugLog.shared.log("export zip copy failed: \(error.localizedDescription)")
+                }
+            }
+            if let coordinatorError {
+                DebugLog.shared.log("export zip failed: \(coordinatorError.localizedDescription)")
+            }
+
+            DispatchQueue.main.async {
+                isExporting = false
+                if let zippedURL {
+                    exportItem = ExportItem(url: zippedURL)
+                }
+            }
+        }
     }
 
     private func loadDetail() {

@@ -66,7 +66,9 @@ final class CaptureSessionController: NSObject, ObservableObject {
 
     override init() {
         super.init()
-        previewLayer.videoGravity = .resizeAspectFill
+        // Aspect-fit so the boxed preview shows the entire sensor frame instead
+        // of a cropped fill - what you see is exactly what gets recorded.
+        previewLayer.videoGravity = .resizeAspect
     }
 
     func requestPermissionAndConfigure() {

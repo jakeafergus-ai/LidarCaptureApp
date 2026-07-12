@@ -8,6 +8,44 @@ struct SettingsSheetView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    HStack {
+                        presetButton("Indoor") {
+                            settings.autoExposure = false
+                            settings.shutterDenominator = 250
+                            settings.iso = 640
+                            settings.autoWhiteBalance = true
+                        }
+                        presetButton("Outdoor") {
+                            settings.autoExposure = false
+                            settings.shutterDenominator = 500
+                            settings.iso = 100
+                            settings.autoWhiteBalance = true
+                        }
+                    }
+                    HStack {
+                        presetButton("Low") {
+                            settings.resolution = .hd1080
+                            settings.fps = 30
+                            settings.lidarFps = 12
+                        }
+                        presetButton("Medium") {
+                            settings.resolution = .uhd4K
+                            settings.fps = 24
+                            settings.lidarFps = 24
+                        }
+                        presetButton("High") {
+                            settings.resolution = .uhd4K
+                            settings.fps = 30
+                            settings.lidarFps = 30
+                        }
+                    }
+                } header: {
+                    Text("Presets")
+                } footer: {
+                    Text("Indoor/Outdoor set exposure for a medium-pace walkthrough scan. Low/Medium/High set resolution, frame rate, and LiDAR rate.")
+                }
+
                 Section("Video") {
                     Picker("Resolution", selection: $settings.resolution) {
                         ForEach(CaptureResolution.allCases) { resolution in
@@ -44,11 +82,11 @@ struct SettingsSheetView: View {
                     if !settings.autoExposure {
                         VStack(alignment: .leading) {
                             Text("Shutter: 1/\(Int(settings.shutterDenominator))")
-                            Slider(value: $settings.shutterDenominator, in: 24...2000, step: 1)
+                            steppedSlider(options: CaptureSettings.shutterOptions, value: $settings.shutterDenominator)
                         }
                         VStack(alignment: .leading) {
                             Text("ISO: \(Int(settings.iso))")
-                            Slider(value: $settings.iso, in: 25...3200, step: 1)
+                            steppedSlider(options: CaptureSettings.isoOptions, value: $settings.iso)
                         }
                     }
                 }
@@ -94,5 +132,19 @@ struct SettingsSheetView: View {
                 }
             }
         }
+    }
+
+    private func presetButton(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(title, action: action)
+            .buttonStyle(.bordered)
+            .frame(maxWidth: .infinity)
+    }
+
+    private func steppedSlider(options: [Double], value: Binding<Double>) -> some View {
+        let indexBinding = Binding<Double>(
+            get: { Double(CaptureSettings.nearestIndex(of: value.wrappedValue, in: options)) },
+            set: { value.wrappedValue = options[Int($0.rounded())] }
+        )
+        return Slider(value: indexBinding, in: 0...Double(options.count - 1), step: 1)
     }
 }

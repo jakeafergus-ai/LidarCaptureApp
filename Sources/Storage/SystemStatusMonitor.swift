@@ -6,6 +6,7 @@ import Combine
 /// by the system notification.
 final class SystemStatusMonitor: ObservableObject {
     @Published private(set) var freeBytes: Int64 = 0
+    @Published private(set) var totalBytes: Int64 = 0
     @Published private(set) var thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
 
     private var timer: Timer?
@@ -34,14 +35,26 @@ final class SystemStatusMonitor: ObservableObject {
 
     private func refreshStorage() {
         let url = URL(fileURLWithPath: NSHomeDirectory())
-        if let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
-           let capacity = values.volumeAvailableCapacityForImportantUsage {
-            freeBytes = capacity
+        if let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey]) {
+            if let capacity = values.volumeAvailableCapacityForImportantUsage {
+                freeBytes = capacity
+            }
+            if let total = values.volumeTotalCapacity {
+                totalBytes = Int64(total)
+            }
         }
     }
 
     var freeText: String {
         ByteCountFormatter.string(fromByteCount: freeBytes, countStyle: .file) + " free"
+    }
+
+    var freeGBText: String {
+        String(format: "%.1f GB", Double(freeBytes) / 1_000_000_000)
+    }
+
+    var freeFraction: Double {
+        totalBytes > 0 ? Double(freeBytes) / Double(totalBytes) : 0
     }
 
     var thermalText: String {

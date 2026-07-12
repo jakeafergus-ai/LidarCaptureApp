@@ -52,6 +52,24 @@ final class CaptureSettings: ObservableObject {
     static let fpsOptions = [24, 30, 60]
     static let lidarFpsOptions = [6, 12, 15, 24, 30]
 
+    /// Standard photographic stops so the sliders snap to meaningful values
+    /// instead of every integer.
+    static let shutterOptions: [Double] = [24, 30, 48, 60, 100, 125, 180, 250, 350, 500, 750, 1000, 1500, 2000]
+    static let isoOptions: [Double] = [25, 32, 50, 64, 100, 125, 200, 250, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200]
+
+    static func nearestIndex(of value: Double, in options: [Double]) -> Int {
+        var bestIndex = 0
+        var bestDelta = Double.greatestFiniteMagnitude
+        for (index, option) in options.enumerated() {
+            let delta = abs(option - value)
+            if delta < bestDelta {
+                bestDelta = delta
+                bestIndex = index
+            }
+        }
+        return bestIndex
+    }
+
     func snapshot() -> CaptureSettingsSnapshot {
         CaptureSettingsSnapshot(
             resolution: resolution,
