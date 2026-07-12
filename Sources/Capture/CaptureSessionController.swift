@@ -239,6 +239,16 @@ final class CaptureSessionController: NSObject, ObservableObject {
             let chosenDepthPair = selectMultiCamDepthFormat(for: lidarDevice)
             let depthFormatSelected = chosenDepthPair != nil
 
+            // Constrain the ultrawide too: left at its default (max-res, high-fps)
+            // format it alone pushed systemPressureCost to 1.84 on-device. A
+            // 1080p-class multicam format capped at 30fps costs a fraction of that.
+            if let uwFormat = selectUltrawideMultiCamFormat(for: ultrawideDevice) {
+                let d = CMVideoFormatDescriptionGetDimensions(uwFormat.formatDescription)
+                diagConfigSummary += " | uw \(d.width)x\(d.height)@30"
+            } else {
+                diagConfigSummary += " | uw default"
+            }
+
             guard let ultrawidePort = ultrawideInput.ports(for: .video,
                                                              sourceDeviceType: ultrawideDevice.deviceType,
                                                              sourceDevicePosition: .back).first else {
@@ -348,13 +358,23 @@ final class CaptureSessionController: NSObject, ObservableObject {
                 self.lastSystemPressureCost = systemPressureCost
             }
 
-            guard hardwareCost < 1.0, systemPressureCost < 1.0 else {
-                DebugLog.shared.log(String(format: "multicam OVER BUDGET hw %.2f pr %.2f - falling back", hardwareCost, systemPressureCost))
+            // Only hardware cost >= 1.0 actually prevents a session from running.
+            // Elevated systemPressureCost means the session runs but may throttle
+            // under sustained load - a warn-and-monitor condition, not a reason to
+            // silently drop depth (which is what the old stricter guard did).
+            guard hardwareCost < 1.0 else {
+                DebugLog.shared.log(String(format: "multicam hardware cost OVER BUDGET hw %.2f - falling back", hardwareCost))
                 DispatchQueue.main.async {
-                    self.setupError = String(format: "Multi-cam over budget (hardwareCost %.2f, systemPressureCost %.2f) - falling back to video only.", hardwareCost, systemPressureCost)
+                    self.setupError = String(format: "Multi-cam hardware cost over budget (%.2f) - falling back to video only.", hardwareCost)
                 }
                 configureSingleCameraSession(deviceType: .builtInUltraWideCamera, withDepth: false)
                 return
+            }
+            if systemPressureCost >= 1.0 {
+                DebugLog.shared.log(String(format: "multicam proceeding with elevated system pressure %.2f - may throttle when hot", systemPressureCost))
+                DispatchQueue.main.async {
+                    self.setupError = String(format: "High system pressure (%.2f) - capture may throttle if the phone gets hot.", systemPressureCost)
+                }
             }
 
             self.videoDataOutput = videoOutput
@@ -436,7 +456,8 @@ final class CaptureSessionController: NSObject, ObservableObject {
         let chosenFormat = eligible.min { lhs, rhs in
             let l = CMVideoFormatDescriptionGetDimensions(lhs.formatDescription)
             let r = CMVideoFormatDescriptionGetDimensions(rhs.formatDescription)
-            return l.width < r.width
+            if l.width != r.width { return l.width < r.width }
+            return maxFrameRate(of: lhs) < maxFrameRate(of: rhs)
         }
 
         guard let chosenFormat, let depthFormat = float32DepthFormat(in: chosenFormat) else {
@@ -492,6 +513,47 @@ final class CaptureSessionController: NSObject, ObservableObject {
         }
         timer.resume()
         snapshotTimer = timer
+    }
+
+    private func maxFrameRate(of format: AVCaptureDevice.Format) -> Double {
+        format.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 0
+    }
+
+    /// Explicitly constrains the ultrawide's format in multicam mode. Multicam
+    /// pressure cost scales with resolution and fps; the device default is the
+    /// biggest, fastest format. Prefers the smallest multicam-supported format
+    /// that is still at least 1080p-class, binned when available, capped at 30fps.
+    private func selectUltrawideMultiCamFormat(for device: AVCaptureDevice) -> AVCaptureDevice.Format? {
+        let eligible = device.formats.filter { $0.isMultiCamSupported }
+        func dims(_ format: AVCaptureDevice.Format) -> CMVideoDimensions {
+            CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+        }
+
+        let hdCandidates = eligible.filter { dims($0).width >= 1920 && maxFrameRate(of: $0) >= 30 }
+        let chosen = hdCandidates.min { lhs, rhs in
+            if dims(lhs).width != dims(rhs).width { return dims(lhs).width < dims(rhs).width }
+            if lhs.isVideoBinned != rhs.isVideoBinned { return lhs.isVideoBinned }
+            return maxFrameRate(of: lhs) < maxFrameRate(of: rhs)
+        } ?? eligible.min { dims($0).width < dims($1).width }
+
+        guard let chosen else {
+            DebugLog.shared.log("ultrawide: no multicam-supported format found, leaving default")
+            return nil
+        }
+
+        do {
+            try device.lockForConfiguration()
+            device.activeFormat = chosen
+            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
+            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+            device.unlockForConfiguration()
+            let d = dims(chosen)
+            DebugLog.shared.log("ultrawide format set: \(d.width)x\(d.height) binned=\(chosen.isVideoBinned) capped 30fps")
+            return chosen
+        } catch {
+            DebugLog.shared.log("ultrawide format config error: \(error.localizedDescription)")
+            return nil
+        }
     }
 
     private func apply(format: AVCaptureDevice.Format, depthFormat: AVCaptureDevice.Format, to device: AVCaptureDevice) -> Bool {
