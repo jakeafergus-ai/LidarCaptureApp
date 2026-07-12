@@ -74,12 +74,17 @@ final class CaptureCoordinator: NSObject, ObservableObject, CaptureFrameSink {
         for (key, value) in settings.manifestFields() {
             extraMetadata[key] = value
         }
+        if let extrinsics = sessionController.lidarToUltrawideExtrinsics {
+            extraMetadata["wideToUltrawideExtrinsics"] = extrinsics
+            extraMetadata["wideToUltrawideExtrinsicsNote"] = "Factory-calibrated 4x3 pose (rotation+translation, mm) from the LiDAR/wide camera to the ultrawide camera, as 12 floats from AVCaptureDevice.extrinsicMatrix."
+        }
         depthThrottler = DepthThrottler(fps: settings.lidarFps)
         guard let recordingSession = RecordingSession(sessionName: sessionName, extraMetadata: extraMetadata) else {
             statusMessage = "Failed to create session folder"
             return
         }
         sessionController.lockRotationForRecording()
+        recordingSession.startAuxiliaryCapture()
         self.recordingSession = recordingSession
         videoFrameCount = 0
         depthFrameCount = 0
@@ -104,12 +109,17 @@ final class CaptureCoordinator: NSObject, ObservableObject, CaptureFrameSink {
 
     func captureController(_ controller: CaptureSessionController, didOutputVideo sampleBuffer: CMSampleBuffer) {
         guard isRecording, let recordingSession else { return }
-        recordingSession.handleVideo(sampleBuffer: sampleBuffer)
+        recordingSession.handleVideo(sampleBuffer: sampleBuffer, lensPosition: controller.currentLensPosition)
 
         DispatchQueue.main.async {
             self.videoFrameCount = recordingSession.frameCount
             self.depthFrameCount = recordingSession.depthFrameCount
         }
+    }
+
+    func captureController(_ controller: CaptureSessionController, didDropFrame stream: String, timestamp: CMTime) {
+        guard isRecording, let recordingSession else { return }
+        recordingSession.handleDrop(stream: stream, timestamp: timestamp)
     }
 
     func captureController(_ controller: CaptureSessionController, didOutputCompanionVideo sampleBuffer: CMSampleBuffer) {

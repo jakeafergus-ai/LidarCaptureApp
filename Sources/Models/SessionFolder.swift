@@ -8,6 +8,9 @@ struct SessionFolder {
     var wideVideoURL: URL { rootURL.appendingPathComponent("wide.mov") }
     var depthFolderURL: URL { rootURL.appendingPathComponent("depth", isDirectory: true) }
     var manifestURL: URL { rootURL.appendingPathComponent("manifest.json") }
+    var motionURL: URL { rootURL.appendingPathComponent("motion.csv") }
+    var framesURL: URL { rootURL.appendingPathComponent("frames.csv") }
+    var dropsURL: URL { rootURL.appendingPathComponent("drops.csv") }
 
     static func create(sessionName: String) -> SessionFolder? {
         guard let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {

@@ -5,6 +5,7 @@ protocol CaptureFrameSink: AnyObject {
     func captureController(_ controller: CaptureSessionController, didOutputVideo sampleBuffer: CMSampleBuffer)
     func captureController(_ controller: CaptureSessionController, didOutputCompanionVideo sampleBuffer: CMSampleBuffer)
     func captureController(_ controller: CaptureSessionController, didOutputDepth depthData: AVDepthData, timestamp: CMTime)
+    func captureController(_ controller: CaptureSessionController, didDropFrame stream: String, timestamp: CMTime)
 }
 
 final class CaptureSessionController: NSObject, ObservableObject {
@@ -52,6 +53,16 @@ final class CaptureSessionController: NSObject, ObservableObject {
     @Published private(set) var lastHardwareCost: Double = 0
     @Published private(set) var lastSystemPressureCost: Double = 0
     @Published private(set) var diagSummary = ""
+
+    /// Factory-calibrated relative pose (rotation + translation, row-major 4x3)
+    /// from the LiDAR/wide camera to the ultrawide camera, captured in multicam
+    /// mode. This is exactly the lens-offset transform the downstream pipeline
+    /// needs to carry wide-registered depth/poses over to the ultrawide frames.
+    private(set) var lidarToUltrawideExtrinsics: [Double]?
+
+    var currentLensPosition: Float {
+        primaryDevice?.lensPosition ?? -1
+    }
 
     override init() {
         super.init()
@@ -240,8 +251,13 @@ final class CaptureSessionController: NSObject, ObservableObject {
         let synchronizer = AVCaptureDataOutputSynchronizer(dataOutputs: outputsToSync)
         synchronizer.setDelegate(self, queue: dataOutputQueue)
 
-        if let connection = videoOutput.connection(with: .video), connection.isVideoStabilizationSupported {
-            connection.preferredVideoStabilizationMode = settingsSnapshot.stabilization ? .standard : .off
+        if let connection = videoOutput.connection(with: .video) {
+            if connection.isVideoStabilizationSupported {
+                connection.preferredVideoStabilizationMode = settingsSnapshot.stabilization ? .standard : .off
+            }
+            if connection.isCameraIntrinsicMatrixDeliverySupported {
+                connection.isCameraIntrinsicMatrixDeliveryEnabled = true
+            }
         }
 
         newSession.commitConfiguration()
@@ -347,6 +363,9 @@ final class CaptureSessionController: NSObject, ObservableObject {
             newSession.addConnection(videoConnection)
             if videoConnection.isVideoStabilizationSupported {
                 videoConnection.preferredVideoStabilizationMode = settingsSnapshot.stabilization ? .standard : .off
+            }
+            if videoConnection.isCameraIntrinsicMatrixDeliverySupported {
+                videoConnection.isCameraIntrinsicMatrixDeliveryEnabled = true
             }
             // Primary ultrawide video is delivered via its own plain delegate, not
             // the synchronizer: the synchronizer is reserved for the LiDAR device's
@@ -471,6 +490,15 @@ final class CaptureSessionController: NSObject, ObservableObject {
             applyManualControls(to: ultrawideDevice)
             attachSessionObservers(to: newSession)
             startSnapshotTimer()
+
+            if let extrinsicsData = AVCaptureDevice.extrinsicMatrix(from: lidarDevice, to: ultrawideDevice) {
+                let floats = extrinsicsData.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+                lidarToUltrawideExtrinsics = floats.map(Double.init)
+                DebugLog.shared.log("wide->ultrawide extrinsics captured (\(floats.count) values)")
+            } else {
+                lidarToUltrawideExtrinsics = nil
+                DebugLog.shared.log("wide->ultrawide extrinsics unavailable")
+            }
 
             dataOutputQueue.async {
                 self.diagVideoCallbackCount = 0
@@ -778,6 +806,7 @@ extension CaptureSessionController: AVCaptureDataOutputSynchronizerDelegate {
            let syncedDepthData = synchronizedDataCollection.synchronizedData(for: depthOutput) as? AVCaptureSynchronizedDepthData {
             if syncedDepthData.depthDataWasDropped {
                 diagDepthDroppedCount += 1
+                frameSink?.captureController(self, didDropFrame: "depth", timestamp: syncedDepthData.timestamp)
             } else {
                 diagDepthPresentCount += 1
                 frameSink?.captureController(self, didOutputDepth: syncedDepthData.depthData, timestamp: syncedDepthData.timestamp)
@@ -786,16 +815,22 @@ extension CaptureSessionController: AVCaptureDataOutputSynchronizerDelegate {
 
         // 1x mode: the LiDAR device's video is the primary recorded stream.
         if let companionOutput = lidarCompanionVideoOutput {
-            if let syncedCompanion = synchronizedDataCollection.synchronizedData(for: companionOutput) as? AVCaptureSynchronizedSampleBufferData,
-               !syncedCompanion.sampleBufferWasDropped {
-                diagCompanionCallbackCount += 1
-                frameSink?.captureController(self, didOutputCompanionVideo: syncedCompanion.sampleBuffer)
+            if let syncedCompanion = synchronizedDataCollection.synchronizedData(for: companionOutput) as? AVCaptureSynchronizedSampleBufferData {
+                if syncedCompanion.sampleBufferWasDropped {
+                    frameSink?.captureController(self, didDropFrame: "wide", timestamp: syncedCompanion.timestamp)
+                } else {
+                    diagCompanionCallbackCount += 1
+                    frameSink?.captureController(self, didOutputCompanionVideo: syncedCompanion.sampleBuffer)
+                }
             }
         } else if let videoOutput = videoDataOutput,
-                  let syncedVideoData = synchronizedDataCollection.synchronizedData(for: videoOutput) as? AVCaptureSynchronizedSampleBufferData,
-                  !syncedVideoData.sampleBufferWasDropped {
-            diagVideoCallbackCount += 1
-            frameSink?.captureController(self, didOutputVideo: syncedVideoData.sampleBuffer)
+                  let syncedVideoData = synchronizedDataCollection.synchronizedData(for: videoOutput) as? AVCaptureSynchronizedSampleBufferData {
+            if syncedVideoData.sampleBufferWasDropped {
+                frameSink?.captureController(self, didDropFrame: "video", timestamp: syncedVideoData.timestamp)
+            } else {
+                diagVideoCallbackCount += 1
+                frameSink?.captureController(self, didOutputVideo: syncedVideoData.sampleBuffer)
+            }
         }
 
         diagCollectionCount += 1
@@ -813,5 +848,10 @@ extension CaptureSessionController: AVCaptureVideoDataOutputSampleBufferDelegate
         guard output === videoDataOutput else { return }
         diagVideoCallbackCount += 1
         frameSink?.captureController(self, didOutputVideo: sampleBuffer)
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard output === videoDataOutput else { return }
+        frameSink?.captureController(self, didDropFrame: "video", timestamp: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
     }
 }
