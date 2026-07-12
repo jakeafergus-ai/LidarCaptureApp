@@ -9,6 +9,7 @@ final class CaptureCoordinator: NSObject, ObservableObject, CaptureFrameSink {
     @Published var statusMessage = "Not started"
     @Published var videoFrameCount = 0
     @Published var depthFrameCount = 0
+    @Published var recordingStartedAt: Date?
 
     private var recordingSession: RecordingSession?
     private var depthThrottler = DepthThrottler(fps: 30)
@@ -77,7 +78,7 @@ final class CaptureCoordinator: NSObject, ObservableObject, CaptureFrameSink {
         }
         if let extrinsics = sessionController.lidarToUltrawideExtrinsics {
             extraMetadata["wideToUltrawideExtrinsics"] = extrinsics
-            extraMetadata["wideToUltrawideExtrinsicsNote"] = "Factory-calibrated 4x3 pose (rotation+translation, mm) from the LiDAR/wide camera to the ultrawide camera, as 12 floats from AVCaptureDevice.extrinsicMatrix."
+            extraMetadata["wideToUltrawideExtrinsicsNote"] = "Factory-calibrated pose from the LiDAR/wide camera to the ultrawide camera via AVCaptureDevice.extrinsicMatrix: 16 floats = 4 columns x 4 values (simd padding). Columns 1-3 are rotation columns, column 4 is translation in millimeters; ignore every 4th value (padding)."
         }
         depthThrottler = DepthThrottler(fps: settings.lidarFps)
         guard let recordingSession = RecordingSession(sessionName: sessionName, extraMetadata: extraMetadata) else {
@@ -90,6 +91,7 @@ final class CaptureCoordinator: NSObject, ObservableObject, CaptureFrameSink {
         videoFrameCount = 0
         depthFrameCount = 0
         isRecording = true
+        recordingStartedAt = Date()
         statusMessage = "Recording: \(recordingSession.folder.name)"
         DebugLog.shared.log("record START \(recordingSession.folder.name) depthAvailable=\(sessionController.depthAvailable) diag=\(sessionController.diagSummary)")
     }
@@ -97,6 +99,7 @@ final class CaptureCoordinator: NSObject, ObservableObject, CaptureFrameSink {
     func stopRecording() {
         guard let recordingSession else { return }
         isRecording = false
+        recordingStartedAt = nil
         recordingSession.stopDiagnostics = sessionController.diagSummary
         DebugLog.shared.log("record STOP \(recordingSession.folder.name) v=\(recordingSession.frameCount) w=\(recordingSession.companionFrameCount) d=\(recordingSession.depthFrameCount) diag=\(sessionController.diagSummary)")
         recordingSession.finish { [weak self] in
