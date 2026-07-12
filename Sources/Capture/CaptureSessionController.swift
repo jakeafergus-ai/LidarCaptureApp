@@ -35,6 +35,13 @@ final class CaptureSessionController: NSObject, ObservableObject {
     private var snapshotTimer: DispatchSourceTimer?
     private var activeDepthConnection: AVCaptureConnection?
 
+    /// The device whose image is the recorded primary footage (wide in 1x mode,
+    /// ultrawide in 0.5x mode) - manual exposure/WB/focus controls target it.
+    private var primaryDevice: AVCaptureDevice?
+
+    /// Set by the coordinator before (re)configuring; consumed during setup.
+    var settingsSnapshot = CaptureSettingsSnapshot()
+
     weak var frameSink: CaptureFrameSink?
 
     @Published var isConfigured = false
@@ -87,6 +94,70 @@ final class CaptureSessionController: NSObject, ObservableObject {
             configureSession(for: newMode)
         }
         if wasRunning { startRunning() }
+    }
+
+    /// Resolution/fps changes need a session rebuild (formats are baked into the
+    /// session configuration); everything else applies live via applyLiveControls.
+    func reconfigureForSettingsChange() {
+        guard hasPermission else { return }
+        DebugLog.shared.log("reconfigure for settings change: \(settingsSnapshot.resolution.rawValue)@\(settingsSnapshot.fps)")
+        let wasRunning = session.isRunning
+        if wasRunning { session.stopRunning() }
+        configureSession(for: lensMode)
+        if wasRunning { startRunning() }
+    }
+
+    /// Applies manual exposure/WB/focus from the current settings snapshot to the
+    /// primary device without rebuilding the session.
+    func applyLiveControls() {
+        guard let device = primaryDevice else { return }
+        applyManualControls(to: device)
+    }
+
+    private func applyManualControls(to device: AVCaptureDevice) {
+        let s = settingsSnapshot
+        do {
+            try device.lockForConfiguration()
+
+            if s.autoExposure {
+                if device.isExposureModeSupported(.continuousAutoExposure) {
+                    device.exposureMode = .continuousAutoExposure
+                }
+            } else if device.isExposureModeSupported(.custom) {
+                let format = device.activeFormat
+                let requested = CMTime(value: 1, timescale: CMTimeScale(max(s.shutterDenominator.rounded(), 1)))
+                let duration = CMTimeClampToRange(requested, range: CMTimeRange(start: format.minExposureDuration, end: format.maxExposureDuration))
+                let iso = min(max(Float(s.iso), format.minISO), format.maxISO)
+                device.setExposureModeCustom(duration: duration, iso: iso)
+            }
+
+            if s.autoWhiteBalance {
+                if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                    device.whiteBalanceMode = .continuousAutoWhiteBalance
+                }
+            } else if device.isWhiteBalanceModeSupported(.locked) {
+                let values = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: Float(s.temperatureK), tint: Float(s.tint))
+                var gains = device.deviceWhiteBalanceGains(for: values)
+                let maxGain = device.maxWhiteBalanceGain
+                gains.redGain = min(max(gains.redGain, 1.0), maxGain)
+                gains.greenGain = min(max(gains.greenGain, 1.0), maxGain)
+                gains.blueGain = min(max(gains.blueGain, 1.0), maxGain)
+                device.setWhiteBalanceModeLocked(with: gains)
+            }
+
+            if s.autoFocus {
+                if device.isFocusModeSupported(.continuousAutoFocus) {
+                    device.focusMode = .continuousAutoFocus
+                }
+            } else if device.isFocusModeSupported(.locked) {
+                device.focusMode = .locked
+            }
+
+            device.unlockForConfiguration()
+            DebugLog.shared.log("manual controls applied: ae=\(s.autoExposure) shutter=1/\(Int(s.shutterDenominator)) iso=\(Int(s.iso)) awb=\(s.autoWhiteBalance) temp=\(Int(s.temperatureK)) tint=\(Int(s.tint)) af=\(s.autoFocus)")
+        } catch {
+            DebugLog.shared.log("manual controls error: \(error.localizedDescription)")
+        }
     }
 
     private func configureSession(for mode: LensMode) {
@@ -169,6 +240,10 @@ final class CaptureSessionController: NSObject, ObservableObject {
         let synchronizer = AVCaptureDataOutputSynchronizer(dataOutputs: outputsToSync)
         synchronizer.setDelegate(self, queue: dataOutputQueue)
 
+        if let connection = videoOutput.connection(with: .video), connection.isVideoStabilizationSupported {
+            connection.preferredVideoStabilizationMode = settingsSnapshot.stabilization ? .standard : .off
+        }
+
         newSession.commitConfiguration()
 
         self.videoDataOutput = videoOutput
@@ -177,6 +252,8 @@ final class CaptureSessionController: NSObject, ObservableObject {
         self.outputSynchronizer = synchronizer
         self.session = newSession
         self.activeDepthConnection = depthOutput?.connection(with: .depthData)
+        self.primaryDevice = device
+        applyManualControls(to: device)
         previewLayer.session = newSession
         attachSessionObservers(to: newSession)
         startSnapshotTimer()
@@ -240,11 +317,10 @@ final class CaptureSessionController: NSObject, ObservableObject {
             let depthFormatSelected = chosenDepthPair != nil
 
             // Constrain the ultrawide too: left at its default (max-res, high-fps)
-            // format it alone pushed systemPressureCost to 1.84 on-device. A
-            // 1080p-class multicam format capped at 30fps costs a fraction of that.
+            // format it alone pushed systemPressureCost to 1.84 on-device.
             if let uwFormat = selectUltrawideMultiCamFormat(for: ultrawideDevice) {
                 let d = CMVideoFormatDescriptionGetDimensions(uwFormat.formatDescription)
-                diagConfigSummary += " | uw \(d.width)x\(d.height)@30"
+                diagConfigSummary += " | uw \(d.width)x\(d.height)@\(settingsSnapshot.fps)"
             } else {
                 diagConfigSummary += " | uw default"
             }
@@ -269,6 +345,9 @@ final class CaptureSessionController: NSObject, ObservableObject {
                 throw MultiCamSetupError.generic("Cannot connect ultrawide video.")
             }
             newSession.addConnection(videoConnection)
+            if videoConnection.isVideoStabilizationSupported {
+                videoConnection.preferredVideoStabilizationMode = settingsSnapshot.stabilization ? .standard : .off
+            }
             // Primary ultrawide video is delivered via its own plain delegate, not
             // the synchronizer: the synchronizer is reserved for the LiDAR device's
             // same-device video+depth pairing (the topology proven to work in 1x).
@@ -328,6 +407,11 @@ final class CaptureSessionController: NSObject, ObservableObject {
                 throw MultiCamSetupError.generic("Cannot connect LiDAR companion video.")
             }
             newSession.addConnection(companionConnection)
+            // Stabilization warps the image, breaking the wide video's pixel
+            // registration with the depth maps - always off for the companion.
+            if companionConnection.isVideoStabilizationSupported {
+                companionConnection.preferredVideoStabilizationMode = .off
+            }
 
             let synchronizer = AVCaptureDataOutputSynchronizer(dataOutputs: [companionOutput, depthOutput])
             synchronizer.setDelegate(self, queue: dataOutputQueue)
@@ -383,6 +467,8 @@ final class CaptureSessionController: NSObject, ObservableObject {
             self.outputSynchronizer = synchronizer
             self.session = newSession
             self.activeDepthConnection = depthConnection
+            self.primaryDevice = ultrawideDevice
+            applyManualControls(to: ultrawideDevice)
             attachSessionObservers(to: newSession)
             startSnapshotTimer()
 
@@ -424,18 +510,53 @@ final class CaptureSessionController: NSObject, ObservableObject {
         }
     }
 
-    /// 1x path: searches every format the device supports (not just its current
-    /// default activeFormat) for one with a depth-capable pairing.
+    /// 1x path: picks the depth-capable format closest to the requested
+    /// resolution whose frame rate covers the requested fps, then caps the frame
+    /// rate to the target. Note: constraining frame durations on a depth-streaming
+    /// device is documented to reduce the depth delivery rate - an accepted
+    /// tradeoff for hitting the requested video fps, and visible in diagnostics.
     @discardableResult
     private func selectDepthFormat(for device: AVCaptureDevice) -> Bool {
-        let candidateFormat = float32DepthFormat(in: device.activeFormat) != nil
-            ? device.activeFormat
-            : device.formats.first { float32DepthFormat(in: $0) != nil }
+        let target = settingsSnapshot.resolution.dimensions
+        let targetFps = Double(settingsSnapshot.fps)
 
-        guard let chosenFormat = candidateFormat, let depthFormat = float32DepthFormat(in: chosenFormat) else {
+        let depthCapable = device.formats.filter { float32DepthFormat(in: $0) != nil }
+        guard !depthCapable.isEmpty else { return false }
+
+        func dims(_ format: AVCaptureDevice.Format) -> CMVideoDimensions {
+            CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+        }
+
+        let fpsCapable = depthCapable.filter { maxFrameRate(of: $0) >= targetFps }
+        let pool = fpsCapable.isEmpty ? depthCapable : fpsCapable
+        let chosenFormat = pool.min { lhs, rhs in
+            let lDelta = abs(Int(dims(lhs).width) - Int(target.width))
+            let rDelta = abs(Int(dims(rhs).width) - Int(target.width))
+            if lDelta != rDelta { return lDelta < rDelta }
+            return maxFrameRate(of: lhs) < maxFrameRate(of: rhs)
+        }
+
+        guard let chosenFormat, let depthFormat = float32DepthFormat(in: chosenFormat) else {
             return false
         }
-        return apply(format: chosenFormat, depthFormat: depthFormat, to: device)
+
+        let applied = apply(format: chosenFormat, depthFormat: depthFormat, to: device)
+        if applied {
+            let d = dims(chosenFormat)
+            DebugLog.shared.log("1x format: \(d.width)x\(d.height) maxFps=\(Int(maxFrameRate(of: chosenFormat))) (requested \(target.width)x\(target.height)@\(Int(targetFps)))")
+            if maxFrameRate(of: chosenFormat) >= targetFps {
+                do {
+                    try device.lockForConfiguration()
+                    let duration = CMTime(value: 1, timescale: CMTimeScale(targetFps))
+                    device.activeVideoMinFrameDuration = duration
+                    device.activeVideoMaxFrameDuration = duration
+                    device.unlockForConfiguration()
+                } catch {
+                    DebugLog.shared.log("1x fps cap error: \(error.localizedDescription)")
+                }
+            }
+        }
+        return applied
     }
 
     /// 0.5x path: a device inside a multicam session can only use formats marked
@@ -519,36 +640,52 @@ final class CaptureSessionController: NSObject, ObservableObject {
         format.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 0
     }
 
-    /// Explicitly constrains the ultrawide's format in multicam mode. Multicam
-    /// pressure cost scales with resolution and fps; the device default is the
-    /// biggest, fastest format. Prefers the smallest multicam-supported format
-    /// that is still at least 1080p-class, binned when available, capped at 30fps.
+    /// Explicitly constrains the ultrawide's format in multicam mode - the device
+    /// default is the biggest, fastest format and alone pushed system pressure to
+    /// 1.84 on-device. Targets the user-requested resolution/fps, preferring the
+    /// smallest adequate multicam-supported format (binned when available, since
+    /// binned formats cost far less). Falls back toward closest available if the
+    /// exact request has no multicam-compatible format, logging what it did.
     private func selectUltrawideMultiCamFormat(for device: AVCaptureDevice) -> AVCaptureDevice.Format? {
+        let target = settingsSnapshot.resolution.dimensions
+        let targetFps = Double(settingsSnapshot.fps)
+
         let eligible = device.formats.filter { $0.isMultiCamSupported }
         func dims(_ format: AVCaptureDevice.Format) -> CMVideoDimensions {
             CMVideoFormatDescriptionGetDimensions(format.formatDescription)
         }
 
-        let hdCandidates = eligible.filter { dims($0).width >= 1920 && maxFrameRate(of: $0) >= 30 }
-        let chosen = hdCandidates.min { lhs, rhs in
+        let adequate = eligible.filter { dims($0).width >= target.width && maxFrameRate(of: $0) >= targetFps }
+        let chosen = adequate.min { lhs, rhs in
             if dims(lhs).width != dims(rhs).width { return dims(lhs).width < dims(rhs).width }
             if lhs.isVideoBinned != rhs.isVideoBinned { return lhs.isVideoBinned }
             return maxFrameRate(of: lhs) < maxFrameRate(of: rhs)
-        } ?? eligible.min { dims($0).width < dims($1).width }
+        } ?? eligible.min { lhs, rhs in
+            // Nothing meets the request - take the closest available and log it.
+            let lDelta = abs(Int(dims(lhs).width) - Int(target.width))
+            let rDelta = abs(Int(dims(rhs).width) - Int(target.width))
+            return lDelta < rDelta
+        }
 
         guard let chosen else {
             DebugLog.shared.log("ultrawide: no multicam-supported format found, leaving default")
             return nil
         }
 
+        let d = dims(chosen)
+        if d.width < target.width {
+            DebugLog.shared.log("ultrawide: requested \(target.width)x\(target.height) has no multicam format - clamped to \(d.width)x\(d.height)")
+        }
+
         do {
             try device.lockForConfiguration()
             device.activeFormat = chosen
-            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
-            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+            let cappedFps = min(targetFps, maxFrameRate(of: chosen))
+            let duration = CMTime(value: 1, timescale: CMTimeScale(cappedFps))
+            device.activeVideoMinFrameDuration = duration
+            device.activeVideoMaxFrameDuration = duration
             device.unlockForConfiguration()
-            let d = dims(chosen)
-            DebugLog.shared.log("ultrawide format set: \(d.width)x\(d.height) binned=\(chosen.isVideoBinned) capped 30fps")
+            DebugLog.shared.log("ultrawide format set: \(d.width)x\(d.height) binned=\(chosen.isVideoBinned) capped \(Int(cappedFps))fps (requested \(target.width)x\(target.height)@\(Int(targetFps)))")
             return chosen
         } catch {
             DebugLog.shared.log("ultrawide format config error: \(error.localizedDescription)")

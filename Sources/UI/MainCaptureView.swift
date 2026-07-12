@@ -3,12 +3,15 @@ import SwiftUI
 struct MainCaptureView: View {
     @StateObject private var coordinator: CaptureCoordinator
     @ObservedObject private var sessionController: CaptureSessionController
+    @ObservedObject private var settings: CaptureSettings
     @State private var sessionName: String = ""
+    @State private var showSettings = false
 
     init() {
         let coordinator = CaptureCoordinator()
         _coordinator = StateObject(wrappedValue: coordinator)
         _sessionController = ObservedObject(wrappedValue: coordinator.sessionController)
+        _settings = ObservedObject(wrappedValue: coordinator.settings)
     }
 
     var body: some View {
@@ -30,11 +33,41 @@ struct MainCaptureView: View {
                         .padding(.bottom, 8)
                 }
 
-                recordButton
+                bottomBar
                     .padding(.bottom, 40)
             }
         }
         .onAppear { coordinator.start() }
+        .sheet(isPresented: $showSettings) {
+            SettingsSheetView(settings: coordinator.settings, sessionController: sessionController)
+        }
+    }
+
+    private var bottomBar: some View {
+        ZStack {
+            recordButton
+
+            if !coordinator.isRecording {
+                HStack {
+                    Spacer()
+                    settingsButton
+                        .padding(.trailing, 30)
+                }
+            }
+        }
+    }
+
+    private var settingsButton: some View {
+        Button {
+            showSettings = true
+        } label: {
+            Image(systemName: "gearshape.fill")
+                .font(.title2)
+                .frame(width: 44, height: 44)
+                .background(.black.opacity(0.6))
+                .foregroundStyle(.white)
+                .clipShape(Circle())
+        }
     }
 
     private var statusBar: some View {
@@ -53,6 +86,10 @@ struct MainCaptureView: View {
                 .background(.black.opacity(0.6))
                 .foregroundStyle(.white)
                 .cornerRadius(6)
+
+            Text("\(settings.resolution.rawValue) · \(settings.fps)fps · LiDAR \(settings.lidarFps)fps")
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(0.8))
 
             if sessionController.lensMode == .ultrawide0_5x {
                 Text(depthStatusText)
