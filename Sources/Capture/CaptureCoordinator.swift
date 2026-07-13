@@ -86,6 +86,7 @@ final class CaptureCoordinator: NSObject, ObservableObject, CaptureFrameSink {
             return
         }
         sessionController.lockRotationForRecording()
+        sessionController.lockFocusForRecordingIfManual()
         recordingSession.startAuxiliaryCapture()
         self.recordingSession = recordingSession
         videoFrameCount = 0

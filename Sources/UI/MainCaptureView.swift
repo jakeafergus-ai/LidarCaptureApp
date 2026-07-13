@@ -34,11 +34,24 @@ struct MainCaptureView: View {
                     .padding(.top, 4)
 
                 // Boxed, aspect-fit preview: the entire sensor frame is visible,
-                // uncovered by any controls.
-                CameraPreviewView(controller: sessionController)
+                // uncovered by any controls. Tap to focus when AF is off and idle.
+                CameraPreviewView(controller: sessionController,
+                                  focusTapEnabled: !settings.autoFocus && !coordinator.isRecording)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(Color.black)
                     .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .overlay(alignment: .bottom) {
+                        if !settings.autoFocus && !coordinator.isRecording {
+                            Text("Tap to focus")
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(.white.opacity(0.85))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(.black.opacity(0.5))
+                                .cornerRadius(6)
+                                .padding(.bottom, 8)
+                        }
+                    }
                     .overlay(
                         RoundedRectangle(cornerRadius: 12)
                             .stroke(Color.white.opacity(0.15), lineWidth: 1)

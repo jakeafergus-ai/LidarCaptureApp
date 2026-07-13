@@ -453,6 +453,14 @@ final class CaptureSessionController: NSObject, ObservableObject {
                 diagConfigSummary += reapplied ? " | REAPPLIED" : " | REAPPLY FAILED"
             }
 
+            // Match the companion wide stream's frame rate to the ultrawide
+            // primary. Left uncapped, the LiDAR device runs at its native rate
+            // (~28-30) while the ultrawide is pinned to the requested fps, so
+            // wide.mov and video.mov came out at different rates. Depth rides this
+            // device and is further throttled in software, so this caps depth at
+            // the video fps too - acceptable, and cleaner 1:1 stream alignment.
+            capDeviceFrameRate(lidarDevice, toFps: Double(settingsSnapshot.fps))
+
             let depthConnectionActive = depthConnection.isActive
             diagConfigSummary += String(format: " | depthConn %@ | hw %.2f pr %.2f", depthConnectionActive ? "active" : "INACTIVE", hardwareCost, systemPressureCost)
             publishDiagSummary()
@@ -653,7 +661,16 @@ final class CaptureSessionController: NSObject, ObservableObject {
         timer.setEventHandler { [weak self] in
             guard let self else { return }
             let depthActive = self.activeDepthConnection?.isActive ?? false
-            DebugLog.shared.log("snapshot running=\(self.session.isRunning) v=\(self.diagVideoCallbackCount) w=\(self.diagCompanionCallbackCount) d=\(self.diagDepthPresentCount) drop=\(self.diagDepthDroppedCount) depthConnActive=\(depthActive)")
+            // activeVideoStabilizationMode is the mode iOS actually applied at
+            // runtime, which can differ from what we requested - especially in a
+            // multicam session where stabilization is often unavailable.
+            let stab: String
+            if let connection = self.videoDataOutput?.connection(with: .video) {
+                stab = "req=\(self.stabilizationModeName(connection.preferredVideoStabilizationMode)) active=\(self.stabilizationModeName(connection.activeVideoStabilizationMode))"
+            } else {
+                stab = "req=? active=?"
+            }
+            DebugLog.shared.log("snapshot running=\(self.session.isRunning) v=\(self.diagVideoCallbackCount) w=\(self.diagCompanionCallbackCount) d=\(self.diagDepthPresentCount) drop=\(self.diagDepthDroppedCount) depthConnActive=\(depthActive) stab[\(stab)]")
         }
         timer.resume()
         snapshotTimer = timer
@@ -661,6 +678,83 @@ final class CaptureSessionController: NSObject, ObservableObject {
 
     private func maxFrameRate(of format: AVCaptureDevice.Format) -> Double {
         format.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 0
+    }
+
+    // MARK: Tap-to-focus (manual focus mode only)
+
+    /// Focuses at a point in the preview layer's coordinate space. The preview
+    /// layer converts it to the device's normalized sensor coordinates, honoring
+    /// the aspect-fit gravity so taps map to the right spot.
+    func focus(atLayerPoint layerPoint: CGPoint) {
+        let devicePoint = previewLayer.captureDevicePointConverted(fromLayerPoint: layerPoint)
+        focus(atDevicePoint: devicePoint)
+    }
+
+    /// One-shot focus at a sensor point that then holds. Ignored while autofocus
+    /// is on (continuous AF owns focus) or while recording (focus is locked for
+    /// the clip). .autoFocus performs a single scan and stays put - effectively a
+    /// tap-to-lock, and the next tap re-focuses elsewhere.
+    private func focus(atDevicePoint point: CGPoint) {
+        guard !settingsSnapshot.autoFocus else { return }
+        guard !isRotationLockedForRecording else { return }
+        guard let device = primaryDevice, device.isFocusPointOfInterestSupported else { return }
+        do {
+            try device.lockForConfiguration()
+            device.focusPointOfInterest = point
+            if device.isFocusModeSupported(.autoFocus) {
+                device.focusMode = .autoFocus
+            }
+            device.unlockForConfiguration()
+            DebugLog.shared.log(String(format: "tap focus at sensor point %.3f,%.3f", point.x, point.y))
+        } catch {
+            DebugLog.shared.log("tap focus error: \(error.localizedDescription)")
+        }
+    }
+
+    /// Hard-locks focus at its current position when recording starts in manual
+    /// focus mode, so the focal distance can't drift for the duration of the clip.
+    func lockFocusForRecordingIfManual() {
+        guard !settingsSnapshot.autoFocus else { return }
+        guard let device = primaryDevice, device.isFocusModeSupported(.locked) else { return }
+        do {
+            try device.lockForConfiguration()
+            device.focusMode = .locked
+            device.unlockForConfiguration()
+            DebugLog.shared.log(String(format: "focus locked for recording at lensPosition %.3f", device.lensPosition))
+        } catch {
+            DebugLog.shared.log("focus lock error: \(error.localizedDescription)")
+        }
+    }
+
+    /// Caps a device's video frame rate to the target fps (clamped to its active
+    /// format's supported range). Used to match the 0.5x companion (wide) stream
+    /// to the ultrawide primary so all recorded streams share one frame rate.
+    private func capDeviceFrameRate(_ device: AVCaptureDevice, toFps fps: Double) {
+        let ranges = device.activeFormat.videoSupportedFrameRateRanges
+        let maxSupported = ranges.map { $0.maxFrameRate }.max() ?? fps
+        let minSupported = ranges.map { $0.minFrameRate }.min() ?? 1
+        let capped = min(max(fps, minSupported), maxSupported)
+        do {
+            try device.lockForConfiguration()
+            let duration = CMTime(value: 1, timescale: CMTimeScale(capped))
+            device.activeVideoMinFrameDuration = duration
+            device.activeVideoMaxFrameDuration = duration
+            device.unlockForConfiguration()
+            DebugLog.shared.log("companion (LiDAR/wide) capped to \(Int(capped))fps to match primary")
+        } catch {
+            DebugLog.shared.log("companion fps cap error: \(error.localizedDescription)")
+        }
+    }
+
+    private func stabilizationModeName(_ mode: AVCaptureVideoStabilizationMode) -> String {
+        switch mode {
+        case .off: return "off"
+        case .standard: return "standard"
+        case .cinematic: return "cinematic"
+        case .cinematicExtended: return "cinematicExtended"
+        case .auto: return "auto"
+        @unknown default: return "unknown(\(mode.rawValue))"
+        }
     }
 
     /// Captures the factory-calibrated wide->ultrawide relative pose. The direct
