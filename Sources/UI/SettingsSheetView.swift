@@ -63,6 +63,11 @@ struct SettingsSheetView: View {
                             .font(.caption)
                             .foregroundStyle(.orange)
                     }
+                    Picker("Bitrate", selection: $settings.bitrateTier) {
+                        ForEach(BitrateTier.allCases) { tier in
+                            Text("\(tier.rawValue) (\(tier.bitsPerSecond / 1_000_000) Mbps)").tag(tier)
+                        }
+                    }
                 }
 
                 Section {

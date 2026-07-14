@@ -5,14 +5,18 @@ final class VideoWriter {
     private var videoInput: AVAssetWriterInput?
     private var sessionStarted = false
 
-    func start(outputURL: URL, formatDescription: CMFormatDescription) throws {
+    func start(outputURL: URL, formatDescription: CMFormatDescription, bitsPerSecond: Int) throws {
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
 
         let dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription)
         let outputSettings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: dimensions.width,
-            AVVideoHeightKey: dimensions.height
+            AVVideoHeightKey: dimensions.height,
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: bitsPerSecond,
+                AVVideoExpectedSourceFrameRateKey: 30
+            ]
         ]
 
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: outputSettings)

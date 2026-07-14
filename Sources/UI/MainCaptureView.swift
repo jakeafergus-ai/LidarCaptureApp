@@ -199,6 +199,11 @@ struct MainCaptureView: View {
                     let index = options.firstIndex(of: settings.fps) ?? 0
                     settings.fps = options[(index + 1) % options.count]
                 }
+                chip("BITRATE", settings.bitrateTier.rawValue) {
+                    let options = BitrateTier.allCases
+                    let index = options.firstIndex(of: settings.bitrateTier) ?? 0
+                    settings.bitrateTier = options[(index + 1) % options.count]
+                }
                 chip("ISO", settings.autoExposure ? "A" : "\(Int(settings.iso))", highlighted: expandedControl == .exposure) {
                     toggleExpanded(.exposure)
                 }

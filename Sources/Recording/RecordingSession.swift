@@ -18,18 +18,25 @@ final class RecordingSession {
     private var started = false
     private var companionStarted = false
     private let extraMetadata: [String: Any]
+    private let primaryBitsPerSecond: Int
     var stopDiagnostics: String?
+
+    /// The companion (wide.mov) stream is a low-res depth-registered reference,
+    /// not the priority footage - a fixed modest rate regardless of the chosen
+    /// tier avoids wasting bandwidth/storage on it.
+    private static let companionBitsPerSecond = 10_000_000
 
     private var frameLines: [String] = []
     private var frameFileHandle: FileHandle?
     private var dropLines: [String] = []
     private var dropFileHandle: FileHandle?
 
-    init?(sessionName: String, extraMetadata: [String: Any] = [:]) {
+    init?(sessionName: String, extraMetadata: [String: Any] = [:], primaryBitsPerSecond: Int = BitrateTier.high.bitsPerSecond) {
         guard let folder = SessionFolder.create(sessionName: sessionName) else { return nil }
         self.folder = folder
         self.depthWriter = DepthSidecarWriter(depthFolderURL: folder.depthFolderURL)
         self.extraMetadata = extraMetadata
+        self.primaryBitsPerSecond = primaryBitsPerSecond
 
         FileManager.default.createFile(atPath: folder.framesURL.path,
                                        contents: Data("timestampMicros,lensPosition,fx,fy,cx,cy\n".utf8))
@@ -53,7 +60,7 @@ final class RecordingSession {
 
         if !started {
             do {
-                try videoWriter.start(outputURL: folder.videoURL, formatDescription: formatDescription)
+                try videoWriter.start(outputURL: folder.videoURL, formatDescription: formatDescription, bitsPerSecond: primaryBitsPerSecond)
                 started = true
             } catch {
                 return
@@ -107,7 +114,7 @@ final class RecordingSession {
 
         if !companionStarted {
             do {
-                try companionWriter.start(outputURL: folder.wideVideoURL, formatDescription: formatDescription)
+                try companionWriter.start(outputURL: folder.wideVideoURL, formatDescription: formatDescription, bitsPerSecond: Self.companionBitsPerSecond)
                 companionStarted = true
             } catch {
                 return

@@ -1,6 +1,26 @@
 import Foundation
 import CoreMedia
 
+enum BitrateTier: String, CaseIterable, Identifiable {
+    case low = "Low"
+    case medium = "Medium"
+    case high = "High"
+    case ultra = "Ultra"
+
+    var id: String { rawValue }
+
+    /// Target average bitrate for the primary recorded video (HEVC). The default
+    /// AVAssetWriter bitrate was too low for 4K + multicam + LiDAR captures.
+    var bitsPerSecond: Int {
+        switch self {
+        case .low: return 20_000_000
+        case .medium: return 50_000_000
+        case .high: return 100_000_000
+        case .ultra: return 150_000_000
+        }
+    }
+}
+
 enum CaptureResolution: String, CaseIterable, Identifiable {
     case hd1080 = "1080p"
     case uhd4K = "4K"
@@ -48,6 +68,7 @@ final class CaptureSettings: ObservableObject {
     @Published var tint: Double = 0
     @Published var autoFocus = true
     @Published var stabilization = false
+    @Published var bitrateTier: BitrateTier = .high
 
     static let fpsOptions = [24, 30, 60]
     static let lidarFpsOptions = [6, 12, 15, 24, 30]
@@ -98,7 +119,9 @@ final class CaptureSettings: ObservableObject {
             "temperatureK": temperatureK,
             "tint": tint,
             "autoFocus": autoFocus,
-            "stabilization": stabilization
+            "stabilization": stabilization,
+            "bitrateTier": bitrateTier.rawValue,
+            "bitrateTargetMbps": bitrateTier.bitsPerSecond / 1_000_000
         ]
     }
 }

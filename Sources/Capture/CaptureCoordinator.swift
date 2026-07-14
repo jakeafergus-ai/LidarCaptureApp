@@ -81,7 +81,7 @@ final class CaptureCoordinator: NSObject, ObservableObject, CaptureFrameSink {
             extraMetadata["wideToUltrawideExtrinsicsNote"] = "Factory-calibrated pose from the LiDAR/wide camera to the ultrawide camera via AVCaptureDevice.extrinsicMatrix: 16 floats = 4 columns x 4 values (simd padding). Columns 1-3 are rotation columns, column 4 is translation in millimeters; ignore every 4th value (padding)."
         }
         depthThrottler = DepthThrottler(fps: settings.lidarFps)
-        guard let recordingSession = RecordingSession(sessionName: sessionName, extraMetadata: extraMetadata) else {
+        guard let recordingSession = RecordingSession(sessionName: sessionName, extraMetadata: extraMetadata, primaryBitsPerSecond: settings.bitrateTier.bitsPerSecond) else {
             statusMessage = "Failed to create session folder"
             return
         }
